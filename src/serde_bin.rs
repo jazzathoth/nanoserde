@@ -91,6 +91,17 @@ impl DeBinErr {
             },
         }
     }
+
+    #[cfg(feature = "std")]
+    pub fn err_user<E>(o: usize, error: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            o: o,
+            msg: DeBinErrReason::UserError(Arc::new(error))
+        }
+    }
 }
 
 impl core::fmt::Debug for DeBinErr {

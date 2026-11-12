@@ -267,6 +267,18 @@ impl DeRonState {
         }
     }
 
+    #[cfg(feature="std")]
+    pub fn err_user<E>(&self, error: E) -> DeRonErr
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        DeRonErr {
+            line: self.line,
+            col: self.col,
+            msg: crate::DeRonErrReason::UserError(Arc::new(error)),
+        }
+    }
+
     pub fn eat_comma_paren(&mut self, i: &mut Chars) -> Result<(), DeRonErr> {
         match self.tok {
             DeRonTok::Comma => {
