@@ -1506,13 +1506,9 @@ pub fn parse_data(input: TokenStream) -> Data {
 
     let attributes = next_attributes_list(&mut source);
 
-    let pub_or_type = next_ident(&mut source).expect("Not an ident");
+    let _ = next_visibility_modifier(&mut source);
 
-    let type_keyword = if pub_or_type == "pub" {
-        next_ident(&mut source).expect("pub(whatever) is not supported yet")
-    } else {
-        pub_or_type
-    };
+    let type_keyword = next_ident(&mut source).expect("Expected struct, enum, or union");
 
     let res;
 
