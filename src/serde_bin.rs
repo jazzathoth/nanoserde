@@ -7,6 +7,9 @@ use ::alloc::collections::{BTreeMap, BTreeSet, LinkedList};
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 
+#[cfg(feature="std")]
+use ::alloc::sync::Arc;
+
 /// A trait for objects that can be serialized to binary.
 pub trait SerBin {
     /// Serialize Self to bytes.
@@ -65,6 +68,8 @@ pub enum DeBinErrReason {
     },
     Range(String),
     UnknownDiscriminant(isize),
+    #[cfg(feature="std")]
+    UserError(Arc<dyn Error + Send + Sync + 'static>),
 }
 
 /// The error message when failing to deserialize.
@@ -90,7 +95,7 @@ impl DeBinErr {
 
 impl core::fmt::Debug for DeBinErr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.msg {
+        match &self.msg {
             DeBinErrReason::Length {
                 expected_length: l,
                 actual_length: s,
@@ -99,12 +104,14 @@ impl core::fmt::Debug for DeBinErr {
                 "Bin deserialize error at:{} wanted:{} bytes but max size is {}",
                 self.o, l, s
             ),
-            DeBinErrReason::Range(ref s) => write!(f, "Bin deserialize error at:{} {}", self.o, s),
+            DeBinErrReason::Range(s) => write!(f, "Bin deserialize error at:{} {}", self.o, s),
             DeBinErrReason::UnknownDiscriminant(variant) => write!(
                 f,
                 "Bin deserialize error at {}: Unknown variant {}",
                 self.o, variant
             ),
+            #[cfg(feature="std")]
+            DeBinErrReason::UserError(error) => f.debug_tuple("UserError").field(error).finish(),
         }
     }
 }

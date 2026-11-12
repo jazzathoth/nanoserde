@@ -7,6 +7,9 @@ use ::alloc::format;
 use ::alloc::string::{String, ToString};
 use ::alloc::vec::Vec;
 
+#[cfg(feature="std")]
+use ::alloc::sync::Arc;
+
 /// The internal state of a RON serialization.
 pub struct SerRonState {
     pub out: String,
@@ -138,6 +141,8 @@ pub enum DeRonErrReason {
     OutOfRange(String),
     WrongType(String),
     CannotParse(String),
+    #[cfg(feature="std")]
+    UserError(Arc<dyn Error + Send + Sync + 'static>),
 }
 
 /// The error message when failing to deserialize a Ron string.
@@ -160,6 +165,8 @@ impl core::fmt::Debug for DeRonErrReason {
             Self::OutOfRange(value) => write!(f, "Value out of range {} ", value),
             Self::WrongType(found) => write!(f, "Token wrong type {} ", found),
             Self::CannotParse(unparseable) => write!(f, "Cannot parse {} ", unparseable),
+            #[cfg(feature="std")]
+            Self::UserError(error) => f.debug_tuple("UserError").field(error).finish(),
         }
     }
 }
