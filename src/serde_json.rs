@@ -276,6 +276,18 @@ impl DeJsonState {
         }
     }
 
+    #[cfg(feature = "std")]
+    pub fn err_user<E>(&self, error: E) -> DeJsonErr 
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        DeJsonErr {
+            line: self.line,
+            col: self.col,
+            msg: DeJsonErrReason::UserError(Arc::new(error)),
+        }
+    }
+
     pub fn eat_comma_block(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
         match self.tok {
             DeJsonTok::Comma => {
