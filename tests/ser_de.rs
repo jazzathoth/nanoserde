@@ -59,7 +59,7 @@ fn ser_de() {
 
     #[cfg(feature = "json")]
     {
-        let bytes = SerJson::serialize_json(&test);
+        let bytes = SerJson::serialize_json(&test).unwrap();
         let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
         assert_eq!(test, test_deserialized);
     }

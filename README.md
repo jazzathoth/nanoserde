@@ -47,11 +47,13 @@ For more examples take a look at [tests](/tests)
 | field attribute: `#[nserde(default)]`                     |   •    | no    |   •    | no    |
 | field attribute: `#[nserde(rename = "")]`                 |   •    |   •   |   •    | no    |
 | field attribute: `#[nserde(proxy = "")]`                  | no     |   •   | no     | no    |
+| field attribute: `#[nserde(skip_on_none)]`                |   •    | no    | no     | no    |
 | field attribute: `#[nserde(serialize_none_as_null)]`      |   •    | no    | no     | no    |
 | container attribute: `#[nserde(default)]`                 |   •    | no    |   •    | no    |
 | container attribute: `#[nserde(default = "")]`            |   •    | no    |   •    | no    |
 | container attribute: `#[nserde(default_with = "")]`       |   •    | no    |   •    | no    |
 | container attribute: `#[nserde(skip)]` (implies `default`)|   •    | no    |   •    | no    |
+| container attribute: `#[nserde(skip_on_none)]`            |   •    | no    | no     | no    |
 | container attribute: `#[nserde(serialize_none_as_null)]`  |   •    | no    | no     | no    |
 | container attribute: `#[nserde(rename = "")]`             |   •    |   •   |   •    | no    |
 | container attribute: `#[nserde(proxy = "")]`              |   •    |   •   | no     | no    |

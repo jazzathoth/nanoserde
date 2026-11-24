@@ -500,7 +500,7 @@ enum ArrayVariant {
 #[test]
 fn single_field_array_variants() {
     for value in [ArrayVariant::Values(vec![1, 2]), ArrayVariant::Pair((3, 4))] {
-        let json = nanoserde::SerJson::serialize_json(&value);
+        let json = nanoserde::SerJson::serialize_json(&value).unwrap();
         assert_eq!(ArrayVariant::deserialize_json(&json).unwrap(), value);
     }
 }

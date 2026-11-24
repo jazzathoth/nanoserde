@@ -76,6 +76,13 @@ pub fn attrs_skip(attributes: &[crate::parse::Attribute]) -> bool {
 }
 
 #[cfg(feature = "json")]
+pub fn attrs_skip_on_none(attributes: &[crate::parse::Attribute]) -> bool {
+    attributes
+        .iter()
+        .any(|attr| attr.tokens.len() == 1 && attr.tokens[0] == "skip_on_none")
+}
+
+#[cfg(feature = "json")]
 pub fn attrs_serialize_none_as_null(attributes: &[crate::parse::Attribute]) -> bool {
     attributes
         .iter()
@@ -99,6 +106,7 @@ const KNOWN_NSERDE_ATTRS: &[&str] = &[
     "default_with",
     "transparent",
     "skip",
+    "skip_on_none",
     "serialize_none_as_null",
     "crate",
 ];

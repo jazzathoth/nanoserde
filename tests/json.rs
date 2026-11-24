@@ -262,7 +262,7 @@ fn rename() {
     assert_eq!(test.a, 1);
     assert_eq!(test.b, Bar::A);
 
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
 }
@@ -331,7 +331,7 @@ fn ser_none_as_null() {
     }
 
     let a = Foo { x: None };
-    assert_eq!(SerJson::serialize_json(&a), r#"{}"#);
+    assert_eq!(SerJson::serialize_json(&a).unwrap(), r#"{"x":null}"#);
 
     #[derive(SerJson)]
     #[nserde(serialize_none_as_null)]
@@ -341,10 +341,11 @@ fn ser_none_as_null() {
 
     let b = Foo2 { x: None };
 
-    assert_eq!(SerJson::serialize_json(&b), r#"{"x":null}"#);
+    assert_eq!(SerJson::serialize_json(&b).unwrap(), r#"{"x":null}"#);
 
     #[derive(SerJson)]
     struct Foo3 {
+        #[nserde(skip_on_none)]
         x: Option<i32>,
         #[nserde(serialize_none_as_null)]
         y: Option<i32>,
@@ -352,7 +353,7 @@ fn ser_none_as_null() {
 
     let b = Foo3 { x: None, y: None };
 
-    assert_eq!(SerJson::serialize_json(&b), r#"{"y":null}"#);
+    assert_eq!(SerJson::serialize_json(&b).unwrap(), r#"{"y":null}"#);
 }
 
 #[test]
@@ -416,7 +417,7 @@ fn de_ser_field_skip() {
     test.g = Some(2);
 
     let ser_json = r#"{"a":1,"foo2":{"x":3}}"#;
-    let serialized = SerJson::serialize_json(&test);
+    let serialized = SerJson::serialize_json(&test).unwrap();
     assert_eq!(serialized, ser_json);
 }
 
@@ -501,7 +502,7 @@ fn empty2() {
     #[derive(DeJson, SerJson)]
     pub struct Empty;
 
-    let json = SerJson::serialize_json(&Empty);
+    let json = SerJson::serialize_json(&Empty).unwrap();
 
     let _: Empty = DeJson::deserialize_json(&json).unwrap();
 }
@@ -514,7 +515,7 @@ fn one_field() {
     }
 
     let test = OneField { field: 23. };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
 }
@@ -529,7 +530,7 @@ fn one_field_map() {
     let test = OneField {
         field: BTreeMap::new(),
     };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
 }
@@ -628,7 +629,7 @@ fn serialize_hashmap_with_custom_hasher() {
     map.map.insert("key1".to_string(), 1);
     map.map.insert("key2".to_string(), 2);
 
-    let json = SerJson::serialize_json(&map);
+    let json = SerJson::serialize_json(&map).unwrap();
     let deserialized: CustomHasherMap = DeJson::deserialize_json(&json).unwrap();
 
     assert_eq!(deserialized.map["key1"], 1);
@@ -678,18 +679,20 @@ fn collections() {
     pub struct Test {
         pub a: Vec<i32>,
         pub b: LinkedList<f32>,
-        pub c: BTreeMap<i32, i32>,
+        pub c: BTreeMap<String, i32>,
         pub d: BTreeSet<i32>,
     }
 
     let test: Test = Test {
         a: vec![1, 2, 3],
         b: vec![1.0, 2.0, 3.0, 4.0].into_iter().collect(),
-        c: vec![(1, 2), (3, 4)].into_iter().collect(),
+        c: vec![("1".to_owned(), 2), ("3".to_owned(), 4)]
+            .into_iter()
+            .collect(),
         d: vec![1, 2, 3, 4, 5, 6].into_iter().collect(),
     };
 
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
 
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
 
@@ -799,7 +802,7 @@ fn de_ser_enum() {
         foo3: Fud::C,
     };
 
-    let serialized = SerJson::serialize_json(&data);
+    let serialized = SerJson::serialize_json(&data).unwrap();
     assert_eq!(serialized, json);
 
     let deserialized: Bar = DeJson::deserialize_json(&serialized).unwrap();
@@ -832,7 +835,7 @@ fn de_ser_enum_complex() {
 
     let test: Bar = DeJson::deserialize_json(json).unwrap();
 
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
 
     assert_eq!(json.split_whitespace().collect::<String>(), bytes);
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
@@ -878,9 +881,9 @@ fn test_various_floats() {
     for case in cases {
         assert_eq!(
             FloatWrapper::from(case),
-            <FloatWrapper as DeJson>::deserialize_json(&dbg!(
-                FloatWrapper::from(case).serialize_json()
-            ))
+            <FloatWrapper as DeJson>::deserialize_json(&dbg!(FloatWrapper::from(case)
+                .serialize_json()
+                .unwrap()))
             .unwrap()
         )
     }
@@ -951,7 +954,7 @@ fn field_proxy() {
         foo: NonSerializable { foo: 6 },
     };
 
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
 
     assert!(test == test_deserialized);
@@ -987,7 +990,7 @@ fn object_proxy() {
 
     let test = NonSerializable { foo: 6 };
 
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
 
     assert!(test == test_deserialized);
@@ -1025,7 +1028,7 @@ fn field_option_proxy() {
 
     #[derive(DeJson, SerJson, PartialEq, Debug)]
     pub struct Test {
-        #[nserde(proxy = "U32")]
+        #[nserde(proxy = "U32", skip_on_none)]
         foo: Option<SomeEnum>,
         #[nserde(proxy = "U32")]
         bar: SomeEnum,
@@ -1035,14 +1038,14 @@ fn field_option_proxy() {
         foo: Some(SomeEnum::Three),
         bar: SomeEnum::Two,
     };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
     let test = Test {
         foo: None,
         bar: SomeEnum::One,
     };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
 
@@ -1057,13 +1060,13 @@ fn field_option_proxy() {
 
     // TODO
     // let test = Test2::A(Some(SomeEnum::Three));
-    // let bytes = SerJson::serialize_json(&test);
+    // let bytes = SerJson::serialize_json(&test).unwrap();
     // let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     // assert!(test == test_deserialized);
     let test = Test2::B {
         bar: Some(SomeEnum::One),
     };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
     assert!(test == test_deserialized);
 }
@@ -1079,7 +1082,7 @@ fn tuple_struct() {
     }
 
     let test = Foo { x: Test(5) };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
 
     assert_eq!(bytes, "{\"x\":[5]}");
 
@@ -1100,7 +1103,7 @@ fn tuple_struct_transparent() {
     }
 
     let test = Foo { x: Test(5) };
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
 
     assert_eq!(bytes, "{\"x\":5}");
 
@@ -1118,7 +1121,7 @@ fn tuple_struct2() {
     pub struct Vec2(pub(crate) f32, pub(crate) f32);
 
     let test = Test(0, 1, "asd".to_string(), 2.);
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
 
     let test_deserialized = DeJson::deserialize_json(&bytes).unwrap();
 
@@ -1131,7 +1134,7 @@ fn control_characters() {
     // Generated with serde_json
     let escaped = r#""\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f ""#;
 
-    assert_eq!(SerJson::serialize_json(&string), escaped);
+    assert_eq!(SerJson::serialize_json(&string).unwrap(), escaped);
 }
 
 #[test]
@@ -1162,13 +1165,13 @@ fn ser_str() {
     let a_str = AStr { s: "abc" };
 
     assert_eq!(
-        SerJson::serialize_json(&a_string),
-        SerJson::serialize_json(&a_borrowed_string)
+        SerJson::serialize_json(&a_string).unwrap(),
+        SerJson::serialize_json(&a_borrowed_string).unwrap()
     );
 
     assert_eq!(
-        SerJson::serialize_json(&a_string),
-        SerJson::serialize_json(&a_str)
+        SerJson::serialize_json(&a_string).unwrap(),
+        SerJson::serialize_json(&a_str).unwrap()
     );
 }
 
@@ -1188,7 +1191,7 @@ fn array_leak_test() {
     }
 
     let items: [_; 2] = core::array::from_fn(|_| IncrementOnDrop::default());
-    let serialized = nanoserde::SerJson::serialize_json(&items);
+    let serialized = nanoserde::SerJson::serialize_json(&items).unwrap();
     let corrupted_serialized = &serialized[..serialized.len() - 1];
 
     if let Ok(_) =
@@ -1292,7 +1295,7 @@ fn generic_enum() {
             b: "qwe".to_string()
         }
     );
-    let bytes = SerJson::serialize_json(&test);
+    let bytes = SerJson::serialize_json(&test).unwrap();
     assert_eq!(
         bytes
             .lines()
@@ -1321,7 +1324,7 @@ fn std_time() {
         Duration::new(u64::MAX, 999_999_999),
     ];
     for dur in durations {
-        let serialized = SerJson::serialize_json(&dur);
+        let serialized = SerJson::serialize_json(&dur).unwrap();
         let deserialized: Duration = DeJson::deserialize_json(&serialized).unwrap();
         assert_eq!(dur, deserialized);
     }
@@ -1338,7 +1341,7 @@ fn std_time() {
         SystemTime::UNIX_EPOCH + Duration::new(1_640_995_200, 500_000_000),
     ];
     for time in times {
-        let serialized = SerJson::serialize_json(&time);
+        let serialized = SerJson::serialize_json(&time).unwrap();
         let deserialized: SystemTime = DeJson::deserialize_json(&serialized).unwrap();
         assert_eq!(time, deserialized);
     }
@@ -1358,7 +1361,7 @@ fn std_time() {
         duration: Duration::new(1000, 999_999_999),
         system_time: SystemTime::UNIX_EPOCH + Duration::new(1633072800, 500_000_000),
     };
-    let serialized = SerJson::serialize_json(&test);
+    let serialized = SerJson::serialize_json(&test).unwrap();
     let deserialized = DeJson::deserialize_json(&serialized).unwrap();
     assert_eq!(test, deserialized);
 
@@ -1397,10 +1400,10 @@ fn ts_rs_compat() {
     let expected = "{\"Move\":{\"type_\":\"Absolute\",\"x\":1918,\"y\":616}}";
     let old_expected = "{\"Move\":[{\"type_\":\"Absolute\",\"x\":1918,\"y\":616}]}";
 
-    assert_eq!(expected, tmp.serialize_json());
+    assert_eq!(expected, tmp.serialize_json().unwrap());
     assert_eq!(
         tmp,
-        DeJson::deserialize_json(tmp.serialize_json().as_str()).unwrap()
+        DeJson::deserialize_json(tmp.serialize_json().unwrap().as_str()).unwrap()
     );
     // make sure the old format can still be deserialized
     assert_eq!(tmp, DeJson::deserialize_json(old_expected).unwrap());

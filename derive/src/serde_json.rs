@@ -2,7 +2,7 @@ use ::alloc::format;
 use ::alloc::string::{String, ToString};
 use ::alloc::{vec, vec::Vec};
 
-use crate::parse::{Category, Type};
+use crate::parse::Category;
 use crate::shared::{enum_bounds_strings, struct_bounds_strings};
 use crate::{
     parse::{Enum, Field, Struct},
@@ -13,120 +13,70 @@ use proc_macro::TokenStream;
 
 pub fn derive_ser_json_proxy(proxy_type: &str, type_: &str, crate_name: &str) -> TokenStream {
     format!(
-        "impl {}::SerJson for {} {{
-            fn ser_json(&self, d: usize, s: &mut {}::SerJsonState) {{
-                let proxy: {} = self.into();
-                proxy.ser_json(d, s);
+        "impl {crate_name}::SerJson for {type_} {{
+            fn ser_json(&self, s: &mut {crate_name}::SerJsonScope<'_>) -> Result<(), {crate_name}::SerJsonErr> {{
+                let proxy: {proxy_type} = self.into();
+                proxy.ser_json(s)
             }}
-        }}",
-        crate_name, type_, crate_name, proxy_type
-    )
-    .parse()
-    .unwrap()
+        }}"
+    ).parse().unwrap()
 }
 
 fn ser_proxy_guard(fieldname: &str, field: &Field) -> String {
     if let Some(proxy) = crate::shared::attrs_proxy(&field.attributes) {
         if field.ty.base() == "Option" {
             format!(
-                "{{{fieldname}.as_ref().map(|f| {{let proxy: {proxy} = Into::into(f);proxy}})}}"
+                "&{{({fieldname}).as_ref().map(|f| {{let proxy: {proxy} = Into::into(f);proxy}})}}"
             )
         } else {
-            format!("{{let proxy: {proxy} = Into::into(&{fieldname});proxy}}",)
+            format!("&{{let proxy: {proxy} = Into::into({fieldname});proxy}}",)
         }
     } else {
         fieldname.to_string()
     }
 }
 
-pub fn derive_ser_json_struct(struct_: &Struct, crate_name: &str) -> TokenStream {
-    let mut s = String::new();
-    let (generic_w_bounds, generic_no_bounds) =
-        struct_bounds_strings(struct_, "SerJson", crate_name);
-
-    l!(s, "let mut first_field_was_serialized = false;");
-
-    if !struct_.fields.is_empty() {
-        for field in struct_.fields.iter() {
-            let struct_fieldname = field.field_name.clone().unwrap();
-            let json_fieldname =
-                shared::attrs_rename(&field.attributes).unwrap_or_else(|| struct_fieldname.clone());
-            let skip = shared::attrs_skip(&field.attributes);
-            if skip {
-                continue;
-            }
-            let proxied_field = ser_proxy_guard(&format!("self.{struct_fieldname}"), field);
-
-            if field.ty.base() == "Option" {
-                let proxy_attr = crate::shared::attrs_proxy(&field.attributes);
-                let struct_null_on_none = shared::attrs_serialize_none_as_null(&struct_.attributes);
-                let field_null_on_none = shared::attrs_serialize_none_as_null(&field.attributes);
-                let null_on_none =
-                    (field_null_on_none || struct_null_on_none) && proxy_attr.is_none();
-                let field_header = &format!(
-                    "if first_field_was_serialized {{
-                                                 s.conl();
-                                             }};
-                                             first_field_was_serialized = true;
-                                             s.field(d+1, \"{}\");",
-                    json_fieldname
-                );
-                l!(
-                    s,
-                    "{}
-                    if let Some(t) = &{} {{
-                        {}
-                        t.ser_json(d+1, s);
-                    }} {}",
-                    if null_on_none { field_header } else { "" },
-                    proxied_field,
-                    if null_on_none { "" } else { field_header },
-                    if null_on_none {
-                        "else {{
-                            Option::<i32>::ser_json(&None, d+1, s);
-                        }}"
-                    } else {
-                        ""
-                    }
-                );
-            } else {
-                l!(
-                    s,
-                    "if first_field_was_serialized {{
-                        s.conl();
-                    }};
-                    first_field_was_serialized = true;
-                    s.field(d+1,\"{}\");
-                    {}.ser_json(d+1, s);",
-                    json_fieldname,
-                    proxied_field
-                );
-            }
-        }
+// Generate one field write; omission happens before the scope writes its separator.
+fn ser_json_field(field: &Field, access: &str, struct_skip_on_none: bool) -> String {
+    if shared::attrs_skip(&field.attributes) {
+        return String::new();
     }
+    let struct_field = field.field_name.as_ref().unwrap();
+    let json_field =
+        shared::attrs_rename(&field.attributes).unwrap_or_else(|| struct_field.clone());
+    let value = ser_proxy_guard(access, field);
+    let skip_on_none = shared::attrs_skip_on_none(&field.attributes)
+        || (struct_skip_on_none && !shared::attrs_serialize_none_as_null(&field.attributes));
+    if field.ty.base() == "Option" && skip_on_none {
+        format!("if let Some(value) = {value} {{ s.write_field({json_field:?}, value)?; }}")
+    } else {
+        format!("s.write_field({json_field:?}, {value})?;")
+    }
+}
 
-    format!(
-        "
-        impl{} {}::SerJson for {}{} {{
-            fn ser_json(&self, d: usize, s: &mut {}::SerJsonState) {{
-                s.st_pre();
-                {}
-                s.st_post(d);
-            }}
+pub fn derive_ser_json_struct(struct_: &Struct, crate_name: &str) -> TokenStream {
+    let (bounds, args) = struct_bounds_strings(struct_, "SerJson", crate_name);
+    let mut body = String::new();
+    for field in &struct_.fields {
+        let struct_field = field.field_name.as_ref().unwrap();
+        body.push_str(&ser_json_field(
+            field,
+            &format!("&self.{struct_field}"),
+            shared::attrs_skip_on_none(&struct_.attributes),
+        ));
+    }
+    let name = struct_
+        .name
+        .as_ref()
+        .expect("Cannot implement for anonymous struct");
+    format!("impl{bounds} {crate_name}::SerJson for {name}{args} {{
+        fn ser_json(&self, parent: &mut {crate_name}::SerJsonScope<'_>) -> Result<(), {crate_name}::SerJsonErr> {{
+            let mut s = parent.new_scope()?;
+            s.obj_open()?;
+            {body}
+            s.obj_close()
         }}
-    ",
-        generic_w_bounds,
-        crate_name,
-        struct_
-            .name
-            .as_ref()
-            .expect("Cannot implement for anonymous struct"),
-        generic_no_bounds,
-        crate_name,
-        s
-    )
-    .parse()
-    .unwrap()
+    }}").parse().unwrap()
 }
 
 pub fn derive_de_json_named(
@@ -303,161 +253,74 @@ pub fn derive_de_json_struct(struct_: &Struct, crate_name: &str) -> TokenStream 
 }
 
 pub fn derive_ser_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
-    let mut r = String::new();
-    let (generic_w_bounds, generic_no_bounds) = enum_bounds_strings(enum_, "SerJson", crate_name);
-
-    for variant in enum_.variants.iter() {
-        let field_name = variant.field_name.clone().unwrap();
-        let json_variant_name =
-            shared::attrs_rename(&variant.attributes).unwrap_or(field_name.clone());
-
-        match &variant.ty {
-            Type {
-                wraps: None,
-                ident: Category::None,
-                ..
-            } => {
-                // unit variant
-                l!(
-                    r,
-                    "Self::{} => s.label(\"{}\"),",
-                    &field_name,
-                    json_variant_name
-                );
+    let (bounds, args) = enum_bounds_strings(enum_, "SerJson", crate_name);
+    let mut arms = String::new();
+    for variant in &enum_.variants {
+        let field_name = variant.field_name.as_ref().unwrap();
+        let json_field =
+            shared::attrs_rename(&variant.attributes).unwrap_or_else(|| field_name.clone());
+        match &variant.ty.ident {
+            Category::None => {
+                l!(arms, "Self::{field_name} => s.write_value({json_field:?}),",);
             }
-
-            Type {
-                ident: Category::AnonymousStruct { contents },
-                ..
-            } => {
-                let mut items = String::new();
-                let mut field_names = vec![];
-                let last = contents.fields.len().saturating_sub(1);
-                for (index, field) in contents.fields.iter().enumerate() {
-                    if let Some(name) = &&field.field_name {
-                        let proxied_field = ser_proxy_guard(name, field);
-                        if index == last {
-                            if field.ty.base() == "Option" {
-                                l!(
-                                    items,
-                                    "if {}.is_some(){{s.field(d+1, \"{}\");{}.ser_json(d+1, s);}}",
-                                    name,
-                                    name,
-                                    proxied_field
-                                )
-                            } else {
-                                l!(
-                                    items,
-                                    "s.field(d+1, \"{}\");{}.ser_json(d+1, s);",
-                                    name,
-                                    proxied_field
-                                )
-                            }
-                        } else if field.ty.base() == "Option" {
-                            l!(
-                                    items,
-                                    "if {}.is_some(){{s.field(d+1, \"{}\");{}.ser_json(d+1, s);s.conl();}}",
-                                    name,
-                                    name,
-                                    proxied_field
-                                );
-                        } else {
-                            l!(
-                                items,
-                                "s.field(d+1, \"{}\");{}.ser_json(d+1, s);s.conl();",
-                                name,
-                                proxied_field
-                            );
-                        }
-                        field_names.push(name.clone());
-                    }
-                }
-                l!(
-                    r,
-                    "Self::{} {{ {} }} => {{
-                                s.out.push('{{');
-                                s.label(\"{}\");
-                                s.out.push(':');
-                                s.st_pre();
-                                {}
-                                s.st_post(d);
-                                s.out.push('}}');
-                            }}",
-                    &field_name,
-                    field_names.join(","),
-                    json_variant_name,
-                    items
-                );
-            }
-            Type {
-                ident: Category::Tuple { contents },
-                ..
-            } => {
+            Category::AnonymousStruct { contents } => {
+                let mut body = String::new();
                 let mut names = Vec::new();
-                let mut inner = String::new();
-                let last = contents.len() - 1;
-                for (index, _) in contents.iter().enumerate() {
-                    let field_name = format!("f{}", index);
-                    names.push(field_name.clone());
-                    if index != last {
-                        l!(inner, "{}.ser_json(d, s); s.out.push(',');", field_name);
+                for field in &contents.fields {
+                    let name = field.field_name.as_ref().unwrap();
+                    if shared::attrs_skip(&field.attributes) {
+                        names.push(format!("{name}: _"));
                     } else {
-                        l!(inner, "{}.ser_json(d, s);", field_name);
+                        names.push(name.clone());
                     }
+                    body.push_str(&ser_json_field(
+                        field,
+                        name,
+                        shared::attrs_skip_on_none(&enum_.attributes),
+                    ));
                 }
+                let names = names.join(",");
+                l!(
+                    arms,
+                    "Self::{field_name} {{ {names} }} => {{
+                    let mut outer = s.new_scope()?; outer.obj_open()?;
+                    outer.write_key({json_field:?})?;
+                    {{ let mut s = outer.new_scope()?; s.obj_open()?; {body} s.obj_close()?; }}
+                    outer.obj_close()
+                }},",
+                );
+            }
+            Category::Tuple { contents } => {
+                let names: Vec<_> = (0..contents.len()).map(|i| format!("f{i}")).collect();
+                let pattern = names.join(",");
+                let mut body = String::new();
                 if contents.len() == 1 {
-                    l!(
-                        r,
-                        "Self::{}  ({}) => {{
-                                s.out.push('{{');
-                                s.label(\"{}\");
-                                s.out.push(':');
-                                {}
-                                s.out.push('}}');
-                            }}",
-                        &field_name,
-                        names.join(","),
-                        json_variant_name,
-                        inner
-                    );
+                    l!(body, "outer.write_field({json_field:?}, {})?;", names[0]);
                 } else {
-                    l!(
-                        r,
-                        "Self::{}  ({}) => {{
-                                s.out.push('{{');
-                                s.label(\"{}\");
-                                s.out.push(':');
-                                s.out.push('[');
-                                {}
-                                s.out.push(']');
-                                s.out.push('}}');
-                            }}",
-                        &field_name,
-                        names.join(","),
-                        json_variant_name,
-                        inner
-                    );
+                    l!(body, "outer.write_key({json_field:?})?; {{ let mut array = outer.new_scope()?; array.arr_open()?;",);
+                    for name in &names {
+                        l!(body, "array.write_element({name})?;",);
+                    }
+                    l!(body, "array.arr_close()?; }}",);
                 }
+                l!(
+                    arms,
+                    "Self::{field_name}({pattern}) => {{
+                    let mut outer = s.new_scope()?; outer.obj_open()?;
+                    {body}
+                    outer.obj_close()
+                }},",
+                );
             }
-            v => {
-                unimplemented!("Unexpected type in enum: {:?}", v)
-            }
-        };
+            other => unimplemented!("Unexpected type in enum: {:?}", other),
+        }
     }
-
-    format!(
-        "
-        impl{} {}::SerJson for {}{} {{
-            fn ser_json(&self, d: usize, s: &mut {}::SerJsonState) {{
-                match self {{
-                    {}
-                }}
-            }}
-        }}",
-        generic_w_bounds, crate_name, enum_.name, generic_no_bounds, crate_name, r
-    )
-    .parse()
-    .unwrap()
+    let name = &enum_.name;
+    format!("impl{bounds} {crate_name}::SerJson for {name}{args} {{
+        fn ser_json(&self, s: &mut {crate_name}::SerJsonScope<'_>) -> Result<(), {crate_name}::SerJsonErr> {{
+            match self {{ {arms} }}
+        }}
+    }}").parse().unwrap()
 }
 
 pub fn derive_de_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
@@ -520,54 +383,31 @@ pub fn derive_de_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
 }
 
 pub fn derive_ser_json_struct_unnamed(struct_: &Struct, crate_name: &str) -> TokenStream {
+    let (bounds, args) = struct_bounds_strings(struct_, "SerJson", crate_name);
     let mut body = String::new();
-    let (generic_w_bounds, generic_no_bounds) =
-        struct_bounds_strings(struct_, "SerJson", crate_name);
-
-    let transparent = shared::attrs_transparent(&struct_.attributes);
-
-    // encode empty struct as {}
-    if struct_.fields.is_empty() {
-        l!(body, "s.out.push('{');");
-        l!(body, "s.out.push('}');");
-    }
-    // if its a newtype struct and it should be transparent - skip any curles
-    // and skip "container"
-    else if transparent && struct_.fields.len() == 1 {
-        l!(body, "self.{}.ser_json(d, s);", 0);
-    }
-    // if more than one field - encode as array []
-    else {
-        l!(body, "s.out.push('[');");
-        let last = struct_.fields.len() - 1;
-        for (n, _) in struct_.fields.iter().enumerate() {
-            l!(body, "self.{}.ser_json(d, s);", n);
-            if n != last {
-                l!(body, "s.out.push_str(\", \");");
+    if shared::attrs_transparent(&struct_.attributes) && struct_.fields.len() == 1 {
+        l!(body, "self.0.ser_json(parent)",);
+    } else {
+        l!(body, "let mut s = parent.new_scope()?;",);
+        if struct_.fields.is_empty() {
+            l!(body, "s.obj_open()?; s.obj_close()",);
+        } else {
+            l!(body, "s.arr_open()?;",);
+            for (index, _) in struct_.fields.iter().enumerate() {
+                l!(body, "s.write_element(&self.{index})?;",);
             }
+            l!(body, "s.arr_close()",);
         }
-        l!(body, "s.out.push(']');");
     }
-
-    format!(
-        "
-        impl{} {}::SerJson for {}{} {{
-            fn ser_json(&self, d: usize, s: &mut {}::SerJsonState) {{
-                {}
-            }}
-        }}",
-        generic_w_bounds,
-        crate_name,
-        struct_
-            .name
-            .as_ref()
-            .expect("Cannot implement for anonymous struct"),
-        generic_no_bounds,
-        crate_name,
-        body
-    )
-    .parse()
-    .unwrap()
+    let name = struct_
+        .name
+        .as_ref()
+        .expect("Cannot implement for anonymous struct");
+    format!("impl{bounds} {crate_name}::SerJson for {name}{args} {{
+        fn ser_json(&self, parent: &mut {crate_name}::SerJsonScope<'_>) -> Result<(), {crate_name}::SerJsonErr> {{
+            {body}
+        }}
+    }}").parse().unwrap()
 }
 
 pub fn derive_de_json_struct_unnamed(struct_: &Struct, crate_name: &str) -> TokenStream {

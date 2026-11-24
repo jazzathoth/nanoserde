@@ -13,71 +13,335 @@ use ::alloc::vec::Vec;
 #[cfg(feature = "std")]
 use ::alloc::sync::Arc;
 
-/// The internal state of a JSON serialization.
+/// The output buffer shared by JSON serialization scopes.
 #[non_exhaustive]
 pub struct SerJsonState {
+    /// Direct writes bypass the scope's structural checks.
     pub out: String,
+    indent: usize,
 }
 
 impl SerJsonState {
     pub fn new(out: String) -> Self {
-        Self { out }
+        Self { out, indent: 0 }
     }
 
-    pub fn indent(&mut self, _d: usize) {
-        //for _ in 0..d {
-        //    self.out.push_str("    ");
-        //}
+    pub fn err_block(&self, message: &str) -> SerJsonErr {
+        SerJsonErr {
+            msg: SerJsonErrReason::Block(message.into()),
+        }
     }
-
-    pub fn field(&mut self, d: usize, field: &str) {
-        self.indent(d);
-        self.out.push('"');
-        self.out.push_str(field);
-        self.out.push('"');
-        self.out.push(':');
+    pub fn err_entry(&self, message: &str) -> SerJsonErr {
+        SerJsonErr {
+            msg: SerJsonErrReason::UnexpectedEntry(message.into()),
+        }
     }
-
-    pub fn label(&mut self, label: &str) {
-        self.out.push('"');
-        self.out.push_str(label);
-        self.out.push('"');
+    pub fn err_incomplete(&self, message: &str) -> SerJsonErr {
+        SerJsonErr {
+            msg: SerJsonErrReason::Incomplete(message.into()),
+        }
     }
-
-    pub fn conl(&mut self) {
-        self.out.push(',')
+    pub fn err_serialization(&self, message: &str) -> SerJsonErr {
+        SerJsonErr {
+            msg: SerJsonErrReason::Serialization(message.into()),
+        }
     }
-
-    pub fn st_pre(&mut self) {
-        self.out.push('{');
-    }
-
-    pub fn st_post(&mut self, d: usize) {
-        self.indent(d);
-        self.out.push('}');
+    #[cfg(feature = "std")]
+    pub fn err_user<E: Error + Send + Sync + 'static>(&self, error: E) -> SerJsonErr {
+        SerJsonErr {
+            msg: SerJsonErrReason::UserError(Arc::new(error)),
+        }
     }
 }
 
-/// A trait for objects that can be serialized to JSON.
-pub trait SerJson {
-    /// Serialize Self to a JSON string.
-    ///
-    /// This is a convenient wrapper around `ser_json`.
-    fn serialize_json(&self) -> String {
-        let mut s = SerJsonState { out: String::new() };
-        self.ser_json(0, &mut s);
-        s.out
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SerJsonErrReason {
+    Block(String),
+    UnexpectedEntry(String),
+    Incomplete(String),
+    Serialization(String),
+    #[cfg(feature = "std")]
+    UserError(Arc<dyn Error + Send + Sync + 'static>),
+}
+
+#[derive(Clone, Debug)]
+pub struct SerJsonErr {
+    pub msg: SerJsonErrReason,
+}
+
+impl core::fmt::Display for SerJsonErr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Json Serialize error: {:?}", self.msg)
+    }
+}
+impl Error for SerJsonErr {}
+
+/// Writes one JSON block through a shared output buffer.
+pub struct SerJsonScope<'state> {
+    state: &'state mut SerJsonState,
+    // Expected state indent while writing inside this block.
+    indent: usize,
+    opener: Option<char>,
+}
+
+impl core::ops::Deref for SerJsonScope<'_> {
+    type Target = SerJsonState;
+    fn deref(&self) -> &Self::Target {
+        self.state
+    }
+}
+impl core::ops::DerefMut for SerJsonScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state
+    }
+}
+
+impl<'state> SerJsonScope<'state> {
+    pub fn root(state: &'state mut SerJsonState) -> Self {
+        Self {
+            state,
+            indent: 0,
+            opener: None,
+        }
     }
 
-    /// Serialize Self to a JSON string.
+    pub fn new_scope(&mut self) -> Result<SerJsonScope<'_>, SerJsonErr> {
+        self.check_value()?;
+        let indent = self.indent + 1;
+        Ok(SerJsonScope {
+            state: self.state,
+            indent,
+            opener: None,
+        })
+    }
+
+    /// Expected indent of values inside this scope; the root is zero.
+    pub fn depth(&self) -> usize {
+        self.indent
+    }
+
+    fn check_indent(&self) -> Result<(), SerJsonErr> {
+        if self.state.indent != self.indent {
+            return Err(self.err_block("scope indent does not match the active block"));
+        }
+        Ok(())
+    }
+
+    fn last_char(&self) -> Option<u8> {
+        self.out
+            .as_bytes()
+            .iter()
+            .rfind(|&&c| !matches!(c, b' ' | b'\n' | b'\r' | b'\t'))
+            .copied()
+    }
+
+    fn check_value(&self) -> Result<(), SerJsonErr> {
+        self.check_indent()?;
+        match self.opener {
+            Some('{') if self.last_char() != Some(b':') => {
+                Err(self.err_incomplete("expected ':' before object value"))
+            }
+            Some('[') if !matches!(self.last_char(), Some(b'[' | b',')) => {
+                Err(self.err_incomplete("expected '[' or ',' before array value"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn block_open(&mut self, opener: char) -> Result<(), SerJsonErr> {
+        if self.state.indent + 1 != self.indent || self.opener.is_some() {
+            return Err(self.err_block("scope is not ready to open a block"));
+        }
+        if !matches!(self.last_char(), None | Some(b':' | b'[' | b',')) {
+            return Err(self.err_block("expected a value position before block opener"));
+        }
+        self.out.push(opener);
+        self.opener = Some(opener);
+        self.state.indent += 1;
+        Ok(())
+    }
+    pub fn obj_open(&mut self) -> Result<(), SerJsonErr> {
+        self.block_open('{')
+    }
+    pub fn arr_open(&mut self) -> Result<(), SerJsonErr> {
+        self.block_open('[')
+    }
+
+    pub fn obj_close(&mut self) -> Result<(), SerJsonErr> {
+        self.check_indent()?;
+        if self.opener != Some('{') {
+            return Err(self.err_block("cannot close a scope that is not an open object"));
+        }
+        if matches!(self.last_char(), Some(b':' | b',')) {
+            return Err(self.err_incomplete("trailing comma or missing value before object closer"));
+        }
+        self.out.push('}');
+        self.state.indent -= 1;
+        Ok(())
+    }
+    pub fn arr_close(&mut self) -> Result<(), SerJsonErr> {
+        self.check_indent()?;
+        if self.opener != Some('[') {
+            return Err(self.err_block("cannot close a scope that is not an open array"));
+        }
+        if self.last_char() == Some(b',') {
+            return Err(self.err_incomplete("found trailing comma"));
+        }
+        self.out.push(']');
+        self.state.indent -= 1;
+        Ok(())
+    }
+
+    /// Prepare an object field, inserting its comma when needed.
+    pub fn begin_field(&mut self) -> Result<(), SerJsonErr> {
+        self.check_indent()?;
+        if self.opener != Some('{') {
+            return Err(self.err_entry("cannot write a field outside an object"));
+        }
+        match self.last_char() {
+            Some(b'{') => {}
+            Some(b':') => return Err(self.err_incomplete("previous field is missing its value")),
+            Some(b',') => return Err(self.err_incomplete("missing field after comma")),
+            None => return Err(self.err_incomplete("missing object opener")),
+            _ => self.out.push(','),
+        }
+        Ok(())
+    }
+
+    /// Write a key and colon, leaving its value to the caller.
+    pub fn write_key<K: JsonKey + ?Sized>(&mut self, key: &K) -> Result<(), SerJsonErr> {
+        self.begin_field()?;
+        key.ser_json_key(self)?;
+        self.out.push(':');
+        Ok(())
+    }
+
+    pub fn write_field<K: JsonKey + ?Sized, V: SerJson + ?Sized>(
+        &mut self,
+        key: &K,
+        value: &V,
+    ) -> Result<(), SerJsonErr> {
+        self.write_key(key)?;
+        self.write_value(value)
+    }
+
+    pub fn write_value<V: SerJson + ?Sized>(&mut self, value: &V) -> Result<(), SerJsonErr> {
+        self.check_value()?;
+        value.ser_json(self)
+    }
+
+    /// Prepare an array element, inserting its comma when needed.
+    pub fn begin_element(&mut self) -> Result<(), SerJsonErr> {
+        self.check_indent()?;
+        if self.opener != Some('[') {
+            return Err(self.err_entry("cannot write an element outside an array"));
+        }
+        match self.last_char() {
+            Some(b'[') => {}
+            Some(b',') => return Err(self.err_incomplete("missing element after comma")),
+            None => return Err(self.err_incomplete("missing array opener")),
+            _ => self.out.push(','),
+        }
+        Ok(())
+    }
+
+    pub fn write_element<V: SerJson + ?Sized>(&mut self, value: &V) -> Result<(), SerJsonErr> {
+        self.begin_element()?;
+        self.write_value(value)
+    }
+
+    /// Write an escaped JSON string without checking its structural position.
+    pub fn write_string(&mut self, value: &str) {
+        self.out.push('"');
+        for c in value.chars() {
+            match c {
+                '\x08' => self.out.push_str("\\b"),
+                '\x0c' => self.out.push_str("\\f"),
+                '\n' => self.out.push_str("\\n"),
+                '\r' => self.out.push_str("\\r"),
+                '\t' => self.out.push_str("\\t"),
+                '\\' => self.out.push_str("\\\\"),
+                '"' => self.out.push_str("\\\""),
+                _ if c.is_ascii_control() => {
+                    let _ = write!(self.out, "\\u{:04x}", c as u32);
+                }
+                _ => self.out.push(c),
+            }
+        }
+        self.out.push('"');
+    }
+}
+
+/// Types supported as JSON object keys. Every implementation writes a string key.
+pub trait JsonKey {
+    fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr>;
+}
+impl JsonKey for str {
+    fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        scope.write_string(self);
+        Ok(())
+    }
+}
+impl JsonKey for String {
+    fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        self.as_str().ser_json_key(scope)
+    }
+}
+impl<T: JsonKey + ?Sized> JsonKey for &T {
+    fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        (**self).ser_json_key(scope)
+    }
+}
+macro_rules! impl_json_key_integer {
+    ($($ty:ty),*) => { $(impl JsonKey for $ty {
+        fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+            let _ = write!(scope.out, "\"{self}\""); Ok(())
+        }
+    })* };
+}
+impl_json_key_integer!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+macro_rules! impl_json_key_float {
+    ($($ty:ty),*) => { $(impl JsonKey for $ty {
+        fn ser_json_key(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+            if !self.is_finite() { return Err(scope.err_serialization("numeric key must be finite")); }
+            let _ = write!(scope.out, "\"{self:?}\""); Ok(())
+        }
+    })* };
+}
+impl_json_key_float!(f32, f64);
+
+/// A trait for objects that can be serialized to JSON.
+pub trait SerJson {
+    fn serialize_json(&self) -> Result<String, SerJsonErr> {
+        let mut state = SerJsonState::new(String::new());
+        self.ser_json(&mut SerJsonScope::root(&mut state))?;
+        Ok(state.out)
+    }
+
+    /// Write one complete value or return an error.
     ///
-    /// ```rust
-    /// # use nanoserde::*;
-    /// let mut s = SerJsonState::new(String::new());
-    /// 42u32.ser_json(0, &mut s);
-    /// assert_eq!(s.out, "42");
     /// ```
-    fn ser_json(&self, d: usize, s: &mut SerJsonState);
+    /// use nanoserde::{SerJson, SerJsonErr, SerJsonScope};
+    /// struct Person { name: String }
+    /// impl SerJson for Person {
+    ///     fn ser_json(&self, parent: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+    ///         let mut scope = parent.new_scope()?;
+    ///         scope.obj_open()?;
+    ///         scope.write_field("name", &self.name)?;
+    ///         scope.obj_close()
+    ///     }
+    /// }
+    /// let person = Person { name: "Ada".into() };
+    /// assert_eq!(person.serialize_json().unwrap(), r#"{"name":"Ada"}"#);
+    /// ```
+    fn ser_json(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr>;
+}
+
+impl<T: SerJson + ?Sized> SerJson for &T {
+    fn ser_json(&self, scope: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        (**self).ser_json(scope)
+    }
 }
 
 /// A trait for objects that can be deserialized from JSON.
@@ -593,8 +857,10 @@ impl<'input> DeJsonState<'input> {
 macro_rules! impl_ser_de_json_integer {
     ( $ty:ident, $reader:ident) => {
         impl SerJson for $ty {
-            fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-                _ = write!(s.out, "{self}");
+            fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+                s.check_value()?;
+                let _ = write!(s.out, "{self}");
+                Ok(())
             }
         }
 
@@ -609,8 +875,14 @@ macro_rules! impl_ser_de_json_integer {
 macro_rules! impl_ser_de_json_float {
     ( $ty:ident, $reader:ident) => {
         impl SerJson for $ty {
-            fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-                _ = write!(s.out, "{self:?}");
+            fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+                s.check_value()?;
+                if self.is_finite() {
+                    let _ = write!(s.out, "{self:?}");
+                } else {
+                    s.out.push_str("null");
+                }
+                Ok(())
             }
         }
 
@@ -639,11 +911,10 @@ impl<T> SerJson for Option<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        if let Some(v) = self {
-            v.ser_json(d, s);
-        } else {
-            s.out.push_str("null");
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        match self {
+            Some(value) => value.ser_json(s),
+            None => ().ser_json(s),
         }
     }
 }
@@ -665,8 +936,10 @@ where
 }
 
 impl SerJson for () {
-    fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-        s.out.push_str("null")
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        s.check_value()?;
+        s.out.push_str("null");
+        Ok(())
     }
 }
 
@@ -682,12 +955,10 @@ impl DeJson for () {
 }
 
 impl SerJson for bool {
-    fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-        if *self {
-            s.out.push_str("true")
-        } else {
-            s.out.push_str("false")
-        }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        s.check_value()?;
+        s.out.push_str(if *self { "true" } else { "false" });
+        Ok(())
     }
 }
 
@@ -700,24 +971,10 @@ impl DeJson for bool {
 macro_rules! impl_ser_json_string {
     ($ty: ident) => {
         impl SerJson for $ty {
-            fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-                s.out.push('"');
-                for c in self.chars() {
-                    match c {
-                        '\x08' => s.out += "\\b",
-                        '\x0C' => s.out += "\\f",
-                        '\n' => s.out += "\\n",
-                        '\r' => s.out += "\\r",
-                        '\t' => s.out += "\\t",
-                        _ if c.is_ascii_control() => {
-                            let _ = write!(s.out, "\\u{:04x}", c as u32);
-                        }
-                        '\\' => s.out += "\\\\",
-                        '"' => s.out += "\\\"",
-                        _ => s.out.push(c),
-                    }
-                }
-                s.out.push('"');
+            fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+                s.check_value()?;
+                s.write_string(self);
+                Ok(())
             }
         }
     };
@@ -736,19 +993,13 @@ impl<T> SerJson for Vec<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        if !self.is_empty() {
-            let last = self.len() - 1;
-            for (index, item) in self.iter().enumerate() {
-                s.indent(d + 1);
-                item.ser_json(d + 1, s);
-                if index != last {
-                    s.out.push(',');
-                }
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        for item in self {
+            scope.write_element(item)?;
         }
-        s.out.push(']');
+        scope.arr_close()
     }
 }
 
@@ -773,19 +1024,13 @@ impl<T> SerJson for std::collections::HashSet<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        if !self.is_empty() {
-            let last = self.len() - 1;
-            for (index, item) in self.iter().enumerate() {
-                s.indent(d + 1);
-                item.ser_json(d + 1, s);
-                if index != last {
-                    s.out.push(',');
-                }
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        for item in self {
+            scope.write_element(item)?;
         }
-        s.out.push(']');
+        scope.arr_close()
     }
 }
 
@@ -810,19 +1055,13 @@ impl<T> SerJson for LinkedList<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        if !self.is_empty() {
-            let last = self.len() - 1;
-            for (index, item) in self.iter().enumerate() {
-                s.indent(d + 1);
-                item.ser_json(d + 1, s);
-                if index != last {
-                    s.out.push(',');
-                }
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        for item in self {
+            scope.write_element(item)?;
         }
-        s.out.push(']');
+        scope.arr_close()
     }
 }
 
@@ -846,19 +1085,13 @@ impl<T> SerJson for BTreeSet<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        if !self.is_empty() {
-            let last = self.len() - 1;
-            for (index, item) in self.iter().enumerate() {
-                s.indent(d + 1);
-                item.ser_json(d + 1, s);
-                if index != last {
-                    s.out.push(',');
-                }
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        for item in self {
+            scope.write_element(item)?;
         }
-        s.out.push(']');
+        scope.arr_close()
     }
 }
 
@@ -882,16 +1115,13 @@ impl<T> SerJson for [T]
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        let last = self.len() - 1;
-        for (index, item) in self.iter().enumerate() {
-            item.ser_json(d + 1, s);
-            if index != last {
-                s.out.push(',');
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        for item in self {
+            scope.write_element(item)?;
         }
-        s.out.push(']');
+        scope.arr_close()
     }
 }
 
@@ -900,8 +1130,8 @@ where
     T: SerJson,
 {
     #[inline(always)]
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        self.as_slice().ser_json(d, s)
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        self.as_slice().ser_json(s)
     }
 }
 
@@ -969,12 +1199,12 @@ where
     A: SerJson,
     B: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        self.0.ser_json(d, s);
-        s.out.push(',');
-        self.1.ser_json(d, s);
-        s.out.push(']');
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        scope.write_element(&self.0)?;
+        scope.write_element(&self.1)?;
+        scope.arr_close()
     }
 }
 
@@ -1000,14 +1230,13 @@ where
     B: SerJson,
     C: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        self.0.ser_json(d, s);
-        s.out.push(',');
-        self.1.ser_json(d, s);
-        s.out.push(',');
-        self.2.ser_json(d, s);
-        s.out.push(']');
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        scope.write_element(&self.0)?;
+        scope.write_element(&self.1)?;
+        scope.write_element(&self.2)?;
+        scope.arr_close()
     }
 }
 
@@ -1039,16 +1268,14 @@ where
     C: SerJson,
     D: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('[');
-        self.0.ser_json(d, s);
-        s.out.push(',');
-        self.1.ser_json(d, s);
-        s.out.push(',');
-        self.2.ser_json(d, s);
-        s.out.push(',');
-        self.3.ser_json(d, s);
-        s.out.push(']');
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.arr_open()?;
+        scope.write_element(&self.0)?;
+        scope.write_element(&self.1)?;
+        scope.write_element(&self.2)?;
+        scope.write_element(&self.3)?;
+        scope.arr_close()
     }
 }
 
@@ -1078,23 +1305,16 @@ where
 #[cfg(feature = "std")]
 impl<K, V, S> SerJson for std::collections::HashMap<K, V, S>
 where
-    K: SerJson,
+    K: JsonKey,
     V: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('{');
-        let len = self.len();
-        for (index, (k, v)) in self.iter().enumerate() {
-            s.indent(d + 1);
-            k.ser_json(d + 1, s);
-            s.out.push(':');
-            v.ser_json(d + 1, s);
-            if (index + 1) < len {
-                s.conl();
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.obj_open()?;
+        for (key, value) in self {
+            scope.write_field(key, value)?;
         }
-        s.indent(d);
-        s.out.push('}');
+        scope.obj_close()
     }
 }
 
@@ -1121,23 +1341,16 @@ where
 
 impl<K, V> SerJson for BTreeMap<K, V>
 where
-    K: SerJson,
+    K: JsonKey,
     V: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        s.out.push('{');
-        let len = self.len();
-        for (index, (k, v)) in self.iter().enumerate() {
-            s.indent(d + 1);
-            k.ser_json(d + 1, s);
-            s.out.push(':');
-            v.ser_json(d + 1, s);
-            if (index + 1) < len {
-                s.conl();
-            }
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.obj_open()?;
+        for (key, value) in self {
+            scope.write_field(key, value)?;
         }
-        s.indent(d);
-        s.out.push('}');
+        scope.obj_close()
     }
 }
 
@@ -1164,8 +1377,8 @@ impl<T> SerJson for Box<T>
 where
     T: SerJson,
 {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
-        (**self).ser_json(d, s)
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        (**self).ser_json(s)
     }
 }
 
@@ -1182,13 +1395,14 @@ where
 }
 
 impl SerJson for Duration {
-    fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-        s.out.push('{');
-        _ = write!(s.out, "\"secs\":{}", self.as_secs());
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
+        let mut scope = s.new_scope()?;
+        scope.obj_open()?;
+        scope.write_field("secs", &self.as_secs())?;
         if self.subsec_nanos() > 0 {
-            _ = write!(s.out, ",\"nanos\":{}", self.subsec_nanos());
+            scope.write_field("nanos", &self.subsec_nanos())?;
         }
-        s.out.push('}');
+        scope.obj_close()
     }
 }
 
@@ -1236,10 +1450,10 @@ impl DeJson for Duration {
 
 #[cfg(feature = "std")]
 impl SerJson for std::time::SystemTime {
-    fn ser_json(&self, d: usize, s: &mut SerJsonState) {
+    fn ser_json(&self, s: &mut SerJsonScope<'_>) -> Result<(), SerJsonErr> {
         self.duration_since(std::time::SystemTime::UNIX_EPOCH)
             .ok()
-            .ser_json(d, s);
+            .ser_json(s)
     }
 }
 
