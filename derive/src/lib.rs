@@ -165,3 +165,55 @@ pub fn derive_de_json(input: proc_macro::TokenStream) -> proc_macro::TokenStream
         parse::Data::Union(_) => unimplemented!("Unions are not supported"),
     }
 }
+
+/// Save the declaration for handwritten JSON helper generation.
+#[cfg(feature = "json")]
+#[proc_macro_derive(DeJsonHelpers, attributes(nserde))]
+pub fn derive_de_json_helpers(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let declaration = input.clone();
+    let input = parse::parse_data(input);
+    if let Some(err) = shared::unknown_attr_compile_error(&input) {
+        return err;
+    }
+    match &input {
+        parse::Data::Struct(value) if value.named => derive_json_helpers(value, declaration),
+        _ => "compile_error!(\"DeJsonHelpers requires a struct with named fields\");"
+            .parse()
+            .unwrap(),
+    }
+}
+
+/// Implementation detail of fields_for!.
+#[cfg(feature = "json")]
+#[proc_macro]
+pub fn generate_json_fields_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    generate_json_helper(input, false)
+}
+
+/// Implementation detail of parser_for!.
+#[cfg(feature = "json")]
+#[proc_macro]
+pub fn generate_json_parser_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    generate_json_helper(input, true)
+}
+
+#[cfg(feature = "json")]
+fn generate_json_helper(input: proc_macro::TokenStream, parser: bool) -> proc_macro::TokenStream {
+    let input = parse::parse_data(input);
+    if let Some(err) = shared::unknown_attr_compile_error(&input) {
+        return err;
+    }
+    let crate_name = shared::attrs_crate(input.attributes()).unwrap_or("nanoserde");
+    match &input {
+        parse::Data::Struct(value) if value.named => {
+            if parser {
+                generate_json_parser(value, crate_name)
+            } else {
+                generate_json_fields(value, crate_name)
+            }
+        }
+        _ => "compile_error!(\"JSON helpers require a struct with named fields\");"
+            .parse()
+            .unwrap(),
+    }
+}

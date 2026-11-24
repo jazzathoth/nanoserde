@@ -76,11 +76,11 @@ fn de_illegal_inline_comment() {
 
     let jsons = vec![
         r#"{
-            "a": // comment,
+            "a": // comment
         }"#,
         r#"{
             / comment
-            "a": 1,
+            "a": 1
         }"#,
     ];
 
@@ -132,7 +132,7 @@ fn de_reorder() {
     let json = r#"{
         "a": 1,
         "d": "hello",
-        "b": 2.0,
+        "b": 2.0
     }"#;
 
     let test: Test = DeJson::deserialize_json(json).unwrap();
@@ -152,7 +152,7 @@ fn de_options() {
 
     let json = r#"{
         "a": "asd",
-        "b": "qwe",
+        "b": "qwe"
     }"#;
 
     let test: Test = DeJson::deserialize_json(json).unwrap();
@@ -168,7 +168,7 @@ fn de_option_one_field() {
     }
 
     let json = r#"{
-        "a": "asd",
+        "a": "asd"
     }"#;
 
     let test: Test = DeJson::deserialize_json(json).unwrap();
@@ -178,6 +178,7 @@ fn de_option_one_field() {
 #[test]
 fn de_non_exhaustive() {
     #[derive(DeJson)]
+    #[allow(dead_code)]
     pub struct Test {
         pub a: i32,
         pub b: f32,
@@ -201,11 +202,7 @@ fn de_non_exhaustive() {
         "extra_struct": {"a": 1., "b": [1, {"a": 1}]}
     }"#;
 
-    let test: Test = DeJson::deserialize_json(json).unwrap();
-    assert_eq!(test.a, 1);
-    assert_eq!(test.b, 2.);
-    assert_eq!(test.d.unwrap(), "hello");
-    assert_eq!(test.c, None);
+    assert!(Test::deserialize_json(json).is_err());
 }
 
 #[test]
@@ -221,7 +218,7 @@ fn de_container_default() {
 
     let json = r#"{
         "a": 1,
-        "d": "hello",
+        "d": "hello"
     }"#;
 
     let test: Test = DeJson::deserialize_json(json).unwrap();
@@ -258,7 +255,7 @@ fn rename() {
 
     let json = r#"{
         "fooField": 1,
-        "barField": "fooValue",
+        "barField": "fooValue"
     }"#;
 
     let test: Test = DeJson::deserialize_json(json).unwrap();
@@ -473,9 +470,9 @@ fn empty() {
 }
 
 // https://github.com/not-fl3/nanoserde/issues/157
-// Empty structs should ignore extra JSON fields, same as non-empty structs.
+// Unknown keys now error for empty and non-empty structs alike.
 #[test]
-fn empty_struct_ignores_extra_fields() {
+fn empty_struct_rejects_extra_fields() {
     #[derive(DeJson, Debug)]
     struct EmptyStruct {}
 
@@ -491,12 +488,12 @@ fn empty_struct_ignores_extra_fields() {
     }
 
     let json = r#"{"extra": 123}"#;
-    let _: EmptyStruct = DeJson::deserialize_json(json).unwrap();
-    let _: EmptyStructDefault = DeJson::deserialize_json(json).unwrap();
-    let _: NonEmptyStruct = DeJson::deserialize_json(json).unwrap();
+    assert!(EmptyStruct::deserialize_json(json).is_err());
+    assert!(EmptyStructDefault::deserialize_json(json).is_err());
+    assert!(NonEmptyStruct::deserialize_json(json).is_err());
 
     let nested = r#"{"extra": {"a": 1}, "arr": [1, 2], "s": "x"}"#;
-    let _: EmptyStruct = DeJson::deserialize_json(nested).unwrap();
+    assert!(EmptyStruct::deserialize_json(nested).is_err());
 }
 
 #[test]

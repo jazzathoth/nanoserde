@@ -1,3 +1,6 @@
+#[path = "json/helpers.rs"]
+mod helpers;
+
 use ::core::str::Chars;
 use ::core::{error::Error, fmt::Write, time::Duration};
 
@@ -7,7 +10,7 @@ use ::alloc::format;
 use ::alloc::string::{String, ToString};
 use ::alloc::vec::Vec;
 
-#[cfg(feature="std")]
+#[cfg(feature = "std")]
 use ::alloc::sync::Arc;
 
 /// The internal state of a JSON serialization.
@@ -79,29 +82,38 @@ pub trait SerJson {
 
 /// A trait for objects that can be deserialized from JSON.
 pub trait DeJson: Sized {
-    /// Parse Self from the input string.
-    ///
-    /// This is a convenient wrapper around `de_json`.
+    /// Deserialize exactly one JSON value, allowing surrounding whitespace.
     fn deserialize_json(input: &str) -> Result<Self, DeJsonErr> {
-        let mut state = DeJsonState::default();
-        let mut chars = input.chars();
-        state.next(&mut chars);
-        state.next_tok(&mut chars)?;
-        DeJson::de_json(&mut state, &mut chars)
+        let mut state = DeJsonState::new(input);
+        let mut root = DeJsonScope::root(&mut state);
+        root.next_tok()?;
+        if root.done {
+            return Err(root.err_token("JSON value"));
+        }
+        let value = Self::de_json(&mut root)?;
+        if matches!(root.token(), DeJsonTok::CurlyClose | DeJsonTok::BlockClose) {
+            root.next_tok()?;
+        }
+        if !root.done || *root.token() != DeJsonTok::Eof {
+            return Err(root.err_token("end of input"));
+        }
+        Ok(value)
     }
 
-    /// Parse Self from the input string.
-    ///
-    /// ```rust
-    /// # use nanoserde::*;
-    /// let mut state = DeJsonState::default();
-    /// let mut chars = "42".chars();
-    /// state.next(&mut chars);
-    /// state.next_tok(&mut chars).unwrap();
-    /// let out = u32::de_json(&mut state, &mut chars).unwrap();
-    /// assert_eq!(out, 42);
-    /// ```
-    fn de_json(state: &mut DeJsonState, input: &mut Chars) -> Result<Self, DeJsonErr>;
+    /// Read one value. Container values receive their own temporary scope.
+    fn de_json(parent: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
+        if matches!(parent.token(), DeJsonTok::CurlyOpen | DeJsonTok::BlockOpen) {
+            let mut child = parent.new_scope()?;
+            let value = Self::de_json_value(&mut child)?;
+            child.finish()?;
+            Ok(value)
+        } else {
+            Self::de_json_value(parent)
+        }
+    }
+
+    /// Implement reading within the scope selected by `de_json`.
+    fn de_json_value(scope: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr>;
 }
 
 /// A JSON parsed token.
@@ -128,21 +140,22 @@ pub enum DeJsonTok {
 }
 
 /// The internal state of a JSON deserialization.
-#[derive(Default)]
 #[non_exhaustive]
-pub struct DeJsonState {
-    pub cur: char,
-    pub tok: DeJsonTok,
-    pub strbuf: String,
-    pub numbuf: String,
-    pub identbuf: String,
-    pub line: usize,
-    pub col: usize,
+pub struct DeJsonState<'input> {
+    input: Chars<'input>,
+    cur: char,
+    tok: DeJsonTok,
+    strbuf: String,
+    numbuf: String,
+    identbuf: String,
+    line: usize,
+    col: usize,
 }
 
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum DeJsonErrReason {
+    Separator,
     UnexpectedKey(String),
     UnexpectedToken(DeJsonTok, String),
     MissingKey(String),
@@ -150,21 +163,22 @@ pub enum DeJsonErrReason {
     OutOfRange(String),
     WrongType(String),
     CannotParse(String),
-    #[cfg(feature="std")]
+    #[cfg(feature = "std")]
     UserError(Arc<dyn Error + Send + Sync + 'static>),
 }
 
 /// The error message when failing to deserialize a JSON string.
 #[derive(Clone)]
 pub struct DeJsonErr {
-    pub line: usize,
-    pub col: usize,
+    line: usize,
+    col: usize,
     pub msg: DeJsonErrReason,
 }
 
 impl core::fmt::Debug for DeJsonErrReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Separator => f.write_str("Expected separator or closing delimiter"),
             Self::UnexpectedKey(name) => write!(f, "Unexpected key {}", name),
             Self::MissingKey(name) => write!(f, "Key not found {}", name),
             Self::NoSuchEnum(name) => write!(f, "Enum not defined {}", name),
@@ -174,7 +188,7 @@ impl core::fmt::Debug for DeJsonErrReason {
             Self::OutOfRange(value) => write!(f, "Value out of range {} ", value),
             Self::WrongType(found) => write!(f, "Token wrong type {} ", found),
             Self::CannotParse(unparseable) => write!(f, "Cannot parse {} ", unparseable),
-            #[cfg(feature="std")]
+            #[cfg(feature = "std")]
             Self::UserError(error) => f.debug_tuple("UserError").field(error).finish(),
         }
     }
@@ -205,9 +219,33 @@ impl core::fmt::Display for DeJsonErr {
 
 impl Error for DeJsonErr {}
 
-impl DeJsonState {
-    pub fn next(&mut self, i: &mut Chars) {
-        if let Some(c) = i.next() {
+impl Default for DeJsonState<'_> {
+    fn default() -> Self {
+        Self {
+            input: "".chars(),
+            cur: '\0',
+            tok: DeJsonTok::Bof,
+            strbuf: String::new(),
+            numbuf: String::new(),
+            identbuf: String::new(),
+            line: 0,
+            col: 0,
+        }
+    }
+}
+
+impl<'input> DeJsonState<'input> {
+    pub fn new(input: &'input str) -> Self {
+        let mut state = Self {
+            input: input.chars(),
+            ..Self::default()
+        };
+        state.next();
+        state
+    }
+
+    fn next(&mut self) {
+        if let Some(c) = self.input.next() {
             self.cur = c;
             if self.cur == '\n' {
                 self.line += 1;
@@ -244,6 +282,14 @@ impl DeJsonState {
         }
     }
 
+    pub fn err_sep(&self) -> DeJsonErr {
+        DeJsonErr {
+            line: self.line,
+            col: self.col,
+            msg: DeJsonErrReason::Separator,
+        }
+    }
+
     pub fn err_token(&self, what: &str) -> DeJsonErr {
         DeJsonErr {
             msg: DeJsonErrReason::UnexpectedToken(self.tok.clone(), what.to_string()),
@@ -277,7 +323,7 @@ impl DeJsonState {
     }
 
     #[cfg(feature = "std")]
-    pub fn err_user<E>(&self, error: E) -> DeJsonErr 
+    pub fn err_user<E>(&self, error: E) -> DeJsonErr
     where
         E: Error + Send + Sync + 'static,
     {
@@ -288,217 +334,38 @@ impl DeJsonState {
         }
     }
 
-    pub fn eat_comma_block(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        match self.tok {
-            DeJsonTok::Comma => {
-                self.next_tok(i)?;
-                Ok(())
-            }
-            DeJsonTok::BlockClose => Ok(()),
-            _ => Err(self.err_token(", or ]")),
-        }
-    }
-
-    pub fn whole_field(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        match self.tok {
-            DeJsonTok::F64 { .. }
-            | DeJsonTok::I64 { .. }
-            | DeJsonTok::Str
-            | DeJsonTok::U64 { .. }
-            | DeJsonTok::Bool { .. }
-            | DeJsonTok::Null => {
-                self.next_tok(i)?;
-                Ok(())
-            }
-            DeJsonTok::BlockOpen | DeJsonTok::CurlyOpen => {
-                let mut open_brackets = 0;
-
-                loop {
-                    if let DeJsonTok::BlockOpen | DeJsonTok::CurlyOpen = self.tok {
-                        open_brackets += 1;
-                    }
-
-                    if let DeJsonTok::BlockClose | DeJsonTok::CurlyClose = self.tok {
-                        open_brackets -= 1;
-                    }
-
-                    self.next_tok(i)?;
-
-                    if open_brackets == 0 {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            _ => unimplemented!("{:?}", self.tok),
-        }
-    }
-
-    pub fn eat_comma_curly(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        match self.tok {
-            DeJsonTok::Comma => {
-                self.next_tok(i)?;
-                Ok(())
-            }
-            DeJsonTok::CurlyClose => Ok(()),
-            _ => Err(self.err_token(", or }")),
-        }
-    }
-
-    pub fn colon(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        match self.tok {
-            DeJsonTok::Colon => {
-                self.next_tok(i)?;
-                Ok(())
-            }
-            _ => Err(self.err_token(":")),
-        }
-    }
-
-    pub fn string(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        match &mut self.tok {
-            DeJsonTok::Str => {
-                self.next_tok(i)?;
-                Ok(())
-            }
-            _ => Err(self.err_token("String")),
-        }
-    }
-
-    pub fn next_colon(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        self.next_tok(i)?;
-        self.colon(i)?;
-        Ok(())
-    }
-
-    pub fn next_str(&mut self) -> Option<()> {
-        if let DeJsonTok::Str = &mut self.tok {
-            //let mut s = String::new();
-            //core::mem::swap(&mut s, name);
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    pub fn block_open(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        if self.tok == DeJsonTok::BlockOpen {
-            self.next_tok(i)?;
-            return Ok(());
-        }
-        Err(self.err_token("["))
-    }
-
-    pub fn block_close(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        if self.tok == DeJsonTok::BlockClose {
-            self.next_tok(i)?;
-            return Ok(());
-        }
-        Err(self.err_token("]"))
-    }
-
-    pub fn curly_open(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        if self.tok == DeJsonTok::CurlyOpen {
-            self.next_tok(i)?;
-            return Ok(());
-        }
-        Err(self.err_token("{"))
-    }
-
-    pub fn curly_close(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
-        if self.tok == DeJsonTok::CurlyClose {
-            self.next_tok(i)?;
-            return Ok(());
-        }
-        Err(self.err_token("}"))
-    }
-
-    pub fn u64_range(&mut self, max: u64) -> Result<u64, DeJsonErr> {
-        if let DeJsonTok::U64(value) = self.tok {
-            if value > max {
-                return Err(self.err_range(&format!("{}>{}", value, max)));
-            }
-            return Ok(value);
-        }
-        Err(self.err_token("unsigned integer"))
-    }
-
-    pub fn i64_range(&mut self, min: i64, max: i64) -> Result<i64, DeJsonErr> {
-        if let DeJsonTok::I64(value) = self.tok {
-            if value < min {
-                return Err(self.err_range(&format!("{}<{}", value, min)));
-            }
-            return Ok(value);
-        }
-        if let DeJsonTok::U64(value) = self.tok {
-            if value as i64 > max {
-                return Err(self.err_range(&format!("{}>{}", value, max)));
-            }
-            return Ok(value as i64);
-        }
-        Err(self.err_token("signed integer"))
-    }
-
-    pub fn as_f64(&mut self) -> Result<f64, DeJsonErr> {
-        if let DeJsonTok::I64(value) = self.tok {
-            return Ok(value as f64);
-        }
-        if let DeJsonTok::U64(value) = self.tok {
-            return Ok(value as f64);
-        }
-        if let DeJsonTok::F64(value) = self.tok {
-            return Ok(value);
-        }
-        Err(self.err_token("floating point"))
-    }
-
-    pub fn as_bool(&mut self) -> Result<bool, DeJsonErr> {
-        if let DeJsonTok::Bool(value) = self.tok {
-            return Ok(value);
-        }
-        Err(self.err_token("boolean"))
-    }
-
-    pub fn as_string(&mut self) -> Result<String, DeJsonErr> {
-        if let DeJsonTok::Str = &mut self.tok {
-            let mut val = String::new();
-            core::mem::swap(&mut val, &mut self.strbuf);
-            return Ok(val);
-        }
-        Err(self.err_token("string"))
-    }
-
-    pub fn next_tok(&mut self, i: &mut Chars) -> Result<(), DeJsonErr> {
+    fn scan_token(&mut self) -> Result<(), DeJsonErr> {
+        self.strbuf.clear();
         while self.cur == '\n' || self.cur == '\r' || self.cur == '\t' || self.cur == ' ' {
-            self.next(i);
+            self.next();
         }
         if self.cur == '\0' {
             self.tok = DeJsonTok::Eof;
             return Ok(());
         }
         if self.cur == '/' {
-            self.next(i);
+            self.next();
             match self.cur {
                 '/' => {
                     while self.cur != '\n' && self.cur != '\0' {
-                        self.next(i);
+                        self.next();
                     }
-                    return self.next_tok(i);
+                    return self.scan_token();
                 }
                 '*' => {
                     let mut last = self.cur;
                     loop {
-                        self.next(i);
+                        self.next();
                         if self.cur == '\0' {
                             return Err(self.err_token("MultiLineCommentClose"));
                         }
                         if last == '*' && self.cur == '/' {
-                            self.next(i);
+                            self.next();
                             break;
                         }
                         last = self.cur;
                     }
-                    return self.next_tok(i);
+                    return self.scan_token();
                 }
                 _ => {
                     return Err(self.err_token("CommentOpen"));
@@ -507,70 +374,70 @@ impl DeJsonState {
         }
         match self.cur {
             ':' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::Colon;
                 Ok(())
             }
             ',' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::Comma;
                 Ok(())
             }
             '[' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::BlockOpen;
                 Ok(())
             }
             ']' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::BlockClose;
                 Ok(())
             }
             '{' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::CurlyOpen;
                 Ok(())
             }
             '}' => {
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::CurlyClose;
                 Ok(())
             }
             '-' | '+' | '0'..='9' => {
-                self.numbuf.truncate(0);
+                self.numbuf.clear();
                 let is_neg = if self.cur == '-' || self.cur == '+' {
                     let sign = self.cur;
                     self.numbuf.push(self.cur);
-                    self.next(i);
+                    self.next();
                     sign == '-'
                 } else {
                     false
                 };
                 while self.cur >= '0' && self.cur <= '9' {
                     self.numbuf.push(self.cur);
-                    self.next(i);
+                    self.next();
                 }
                 let mut is_float = false;
                 if self.cur == '.' {
                     is_float = true;
                     self.numbuf.push(self.cur);
-                    self.next(i);
+                    self.next();
                     while self.cur >= '0' && self.cur <= '9' {
                         self.numbuf.push(self.cur);
-                        self.next(i);
+                        self.next();
                     }
                 }
                 if self.cur == 'e' || self.cur == 'E' {
                     is_float = true;
                     self.numbuf.push(self.cur);
-                    self.next(i);
+                    self.next();
                     if self.cur == '-' {
                         self.numbuf.push(self.cur);
-                        self.next(i);
+                        self.next();
                     }
                     while self.cur >= '0' && self.cur <= '9' {
                         self.numbuf.push(self.cur);
-                        self.next(i);
+                        self.next();
                     }
                 }
                 if is_float {
@@ -598,13 +465,13 @@ impl DeJsonState {
                 }
             }
             'a'..='z' | 'A'..='Z' | '_' => {
-                self.identbuf.truncate(0);
+                self.identbuf.clear();
                 while self.cur >= 'a' && self.cur <= 'z'
                     || self.cur >= 'A' && self.cur <= 'Z'
                     || self.cur == '_'
                 {
                     self.identbuf.push(self.cur);
-                    self.next(i);
+                    self.next();
                 }
                 if self.identbuf == "true" {
                     self.tok = DeJsonTok::Bool(true);
@@ -625,11 +492,11 @@ impl DeJsonState {
                 )))
             }
             '"' => {
-                self.strbuf.truncate(0);
-                self.next(i);
+                self.strbuf.clear();
+                self.next();
                 while self.cur != '"' {
                     if self.cur == '\\' {
-                        self.next(i);
+                        self.next();
                         match self.cur {
                             'n' => self.strbuf.push('\n'),
                             'r' => self.strbuf.push('\r'),
@@ -641,7 +508,7 @@ impl DeJsonState {
                                 return Err(self.err_parse("string"));
                             }
                             'u' => {
-                                if let Some(c) = self.hex_unescape_char(i) {
+                                if let Some(c) = self.hex_unescape_char() {
                                     self.strbuf.push(c);
                                     continue;
                                 } else {
@@ -650,16 +517,16 @@ impl DeJsonState {
                             }
                             _ => self.strbuf.push(self.cur),
                         }
-                        self.next(i);
+                        self.next();
                     } else {
                         if self.cur == '\0' {
                             return Err(self.err_parse("string"));
                         }
                         self.strbuf.push(self.cur);
-                        self.next(i);
+                        self.next();
                     }
                 }
-                self.next(i);
+                self.next();
                 self.tok = DeJsonTok::Str;
                 Ok(())
             }
@@ -673,9 +540,9 @@ impl DeJsonState {
     ///
     /// On illegal escapes or unpaired surrogates returns None (and caller
     /// should emit an error).
-    fn hex_unescape_char(&mut self, i: &mut Chars) -> Option<char> {
-        self.next(i);
-        let a = xdigit4(self, i)?;
+    fn hex_unescape_char(&mut self) -> Option<char> {
+        self.next();
+        let a = xdigit4(self)?;
         if let Some(c) = core::char::from_u32(a as u32) {
             return Some(c);
         }
@@ -683,10 +550,10 @@ impl DeJsonState {
         // a trailing surrogate in a `\uXXXX` sequence immediately after.
         let a_is_lead = (0xd800..0xdc00).contains(&a);
         if a_is_lead && self.cur == '\\' {
-            self.next(i);
+            self.next();
             if self.cur == 'u' {
-                self.next(i);
-                let b = xdigit4(self, i)?;
+                self.next();
+                let b = xdigit4(self)?;
                 let b_is_trail = (0xdc00..0xe000).contains(&b);
                 if b_is_trail {
                     // It's a valid pair! We have `[a, b]` where `a` is a leading
@@ -705,9 +572,9 @@ impl DeJsonState {
         return None;
 
         // Helper to turn next 4 ascii hex digits into a u16
-        fn xdigit4(de: &mut DeJsonState, i: &mut Chars) -> Option<u16> {
+        fn xdigit4(de: &mut DeJsonState<'_>) -> Option<u16> {
             // as tempting as it is to try to find a way to use from_str_radix on the
-            // next 4 bytes from `i`, we'd still need to do validation to detect cases
+            // next 4 bytes from the character cursor, we'd still need to do validation to detect cases
             // like `\u+123` and such which makes it less attractive.
             (0..4).try_fold(0u16, |acc, _| {
                 let n = match de.cur {
@@ -716,15 +583,15 @@ impl DeJsonState {
                     'A'..='F' => de.cur as u16 - 'A' as u16 + 10,
                     _ => return None,
                 };
-                de.next(i);
+                de.next();
                 Some(acc * 16 + n)
             })
         }
     }
 }
 
-macro_rules! impl_ser_de_json_unsigned {
-    ( $ ty: ident, $ max: expr) => {
+macro_rules! impl_ser_de_json_integer {
+    ( $ty:ident, $reader:ident) => {
         impl SerJson for $ty {
             fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
                 _ = write!(s.out, "{self}");
@@ -732,36 +599,15 @@ macro_rules! impl_ser_de_json_unsigned {
         }
 
         impl DeJson for $ty {
-            fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<$ty, DeJsonErr> {
-                let val = s.u64_range($max as u64)?;
-                s.next_tok(i)?;
-                return Ok(val as $ty);
-            }
-        }
-    };
-}
-
-macro_rules! impl_ser_de_json_signed {
-    ( $ ty: ident, $ min: expr, $ max: expr) => {
-        impl SerJson for $ty {
-            fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
-                _ = write!(s.out, "{self}");
-            }
-        }
-
-        impl DeJson for $ty {
-            fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<$ty, DeJsonErr> {
-                //s.is_prefix(p, i) ?;
-                let val = s.i64_range($min as i64, $max as i64)?;
-                s.next_tok(i)?;
-                return Ok(val as $ty);
+            fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<$ty, DeJsonErr> {
+                s.$reader()
             }
         }
     };
 }
 
 macro_rules! impl_ser_de_json_float {
-    ( $ ty: ident) => {
+    ( $ty:ident, $reader:ident) => {
         impl SerJson for $ty {
             fn ser_json(&self, _d: usize, s: &mut SerJsonState) {
                 _ = write!(s.out, "{self:?}");
@@ -769,27 +615,25 @@ macro_rules! impl_ser_de_json_float {
         }
 
         impl DeJson for $ty {
-            fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<$ty, DeJsonErr> {
-                //s.is_prefix(p, i) ?;
-                let val = s.as_f64()?;
-                s.next_tok(i)?;
-                return Ok(val as $ty);
+            fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<$ty, DeJsonErr> {
+                s.$reader()
             }
         }
     };
 }
 
-impl_ser_de_json_unsigned!(usize, u64::MAX);
-impl_ser_de_json_unsigned!(u64, u64::MAX);
-impl_ser_de_json_unsigned!(u32, u32::MAX);
-impl_ser_de_json_unsigned!(u16, u16::MAX);
-impl_ser_de_json_unsigned!(u8, u8::MAX);
-impl_ser_de_json_signed!(i64, i64::MIN, i64::MAX);
-impl_ser_de_json_signed!(i32, i32::MIN, i32::MAX);
-impl_ser_de_json_signed!(i16, i16::MIN, i16::MAX);
-impl_ser_de_json_signed!(i8, i8::MIN, i8::MAX);
-impl_ser_de_json_float!(f64);
-impl_ser_de_json_float!(f32);
+impl_ser_de_json_integer!(usize, parse_usize);
+impl_ser_de_json_integer!(u64, parse_u64);
+impl_ser_de_json_integer!(u32, parse_u32);
+impl_ser_de_json_integer!(u16, parse_u16);
+impl_ser_de_json_integer!(u8, parse_u8);
+impl_ser_de_json_integer!(isize, parse_isize);
+impl_ser_de_json_integer!(i64, parse_i64);
+impl_ser_de_json_integer!(i32, parse_i32);
+impl_ser_de_json_integer!(i16, parse_i16);
+impl_ser_de_json_integer!(i8, parse_i8);
+impl_ser_de_json_float!(f64, parse_f64);
+impl_ser_de_json_float!(f32, parse_f32);
 
 impl<T> SerJson for Option<T>
 where
@@ -808,12 +652,15 @@ impl<T> DeJson for Option<T>
 where
     T: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Self, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
+        Self::de_json(s)
+    }
+    fn de_json(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
         if let DeJsonTok::Null = s.tok {
-            s.next_tok(i)?;
+            s.next_tok()?;
             return Ok(None);
         }
-        Ok(Some(DeJson::de_json(s, i)?))
+        Ok(Some(DeJson::de_json(s)?))
     }
 }
 
@@ -824,9 +671,9 @@ impl SerJson for () {
 }
 
 impl DeJson for () {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<(), DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<(), DeJsonErr> {
         if let DeJsonTok::Null = s.tok {
-            s.next_tok(i)?;
+            s.next_tok()?;
             Ok(())
         } else {
             Err(s.err_token("null"))
@@ -845,10 +692,8 @@ impl SerJson for bool {
 }
 
 impl DeJson for bool {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<bool, DeJsonErr> {
-        let val = s.as_bool()?;
-        s.next_tok(i)?;
-        Ok(val)
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<bool, DeJsonErr> {
+        s.parse_bool()
     }
 }
 
@@ -882,10 +727,8 @@ impl_ser_json_string!(String);
 impl_ser_json_string!(str);
 
 impl DeJson for String {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<String, DeJsonErr> {
-        let val = s.as_string()?;
-        s.next_tok(i)?;
-        Ok(val)
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<String, DeJsonErr> {
+        s.parse_string()
     }
 }
 
@@ -913,15 +756,14 @@ impl<T> DeJson for Vec<T>
 where
     T: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Vec<T>, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Vec<T>, DeJsonErr> {
         let mut out = Vec::new();
-        s.block_open(i)?;
+        s.arr_open()?;
 
-        while s.tok != DeJsonTok::BlockClose {
-            out.push(DeJson::de_json(s, i)?);
-            s.eat_comma_block(i)?;
+        while s.array_next_val()? {
+            out.push(DeJson::de_json(s)?);
         }
-        s.block_close(i)?;
+        s.arr_close()?;
         Ok(out)
     }
 }
@@ -952,15 +794,14 @@ impl<T> DeJson for std::collections::HashSet<T>
 where
     T: DeJson + core::hash::Hash + Eq,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Self, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
         let mut out = std::collections::HashSet::new();
-        s.block_open(i)?;
+        s.arr_open()?;
 
-        while s.tok != DeJsonTok::BlockClose {
-            out.insert(DeJson::de_json(s, i)?);
-            s.eat_comma_block(i)?;
+        while s.array_next_val()? {
+            out.insert(DeJson::de_json(s)?);
         }
-        s.block_close(i)?;
+        s.arr_close()?;
         Ok(out)
     }
 }
@@ -989,15 +830,14 @@ impl<T> DeJson for LinkedList<T>
 where
     T: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<LinkedList<T>, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<LinkedList<T>, DeJsonErr> {
         let mut out = LinkedList::new();
-        s.block_open(i)?;
+        s.arr_open()?;
 
-        while s.tok != DeJsonTok::BlockClose {
-            out.push_back(DeJson::de_json(s, i)?);
-            s.eat_comma_block(i)?;
+        while s.array_next_val()? {
+            out.push_back(DeJson::de_json(s)?);
         }
-        s.block_close(i)?;
+        s.arr_close()?;
         Ok(out)
     }
 }
@@ -1026,15 +866,14 @@ impl<T> DeJson for BTreeSet<T>
 where
     T: DeJson + Ord,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<BTreeSet<T>, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<BTreeSet<T>, DeJsonErr> {
         let mut out = BTreeSet::new();
-        s.block_open(i)?;
+        s.arr_open()?;
 
-        while s.tok != DeJsonTok::BlockClose {
-            out.insert(DeJson::de_json(s, i)?);
-            s.eat_comma_block(i)?;
+        while s.array_next_val()? {
+            out.insert(DeJson::de_json(s)?);
         }
-        s.block_close(i)?;
+        s.arr_close()?;
         Ok(out)
     }
 }
@@ -1070,7 +909,7 @@ impl<T, const N: usize> DeJson for [T; N]
 where
     T: DeJson,
 {
-    fn de_json(o: &mut DeJsonState, d: &mut Chars) -> Result<Self, DeJsonErr> {
+    fn de_json_value(o: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
         use ::core::mem::MaybeUninit;
 
         // waiting for uninit_array(or for array::try_from_fn) stabilization
@@ -1078,13 +917,16 @@ where
         // https://github.com/rust-lang/rust/issues/89379
         let mut to: [MaybeUninit<T>; N] =
             unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
-        o.block_open(d)?;
+        o.arr_open()?;
 
         for index in 0..N {
-            to[index] = match DeJson::de_json(o, d).and_then(|ret| {
-                o.eat_comma_block(d)?;
-                Ok(ret)
-            }) {
+            to[index] = match (|| {
+                if o.array_next_val()? {
+                    DeJson::de_json(o)
+                } else {
+                    Err(o.err_token("array element"))
+                }
+            })() {
                 Ok(v) => MaybeUninit::new(v),
                 Err(e) => {
                     // drop all the MaybeUninit values which we've already
@@ -1103,19 +945,23 @@ where
         // initializing before block close so that drop will run automatically if err encountered there
         let initialized =
             unsafe { (*(&to as *const _ as *const MaybeUninit<_>)).assume_init_read() };
-        o.block_close(d)?;
+        if o.array_next_val()? {
+            return Err(o.err_token("]"));
+        }
+        o.arr_close()?;
 
         Ok(initialized)
     }
 }
 
-fn de_json_comma_block<T>(s: &mut DeJsonState, i: &mut Chars) -> Result<T, DeJsonErr>
+fn de_json_array_element<T>(s: &mut DeJsonScope<'_, '_>) -> Result<T, DeJsonErr>
 where
     T: DeJson,
 {
-    let t = DeJson::de_json(s, i);
-    s.eat_comma_block(i)?;
-    t
+    if !s.array_next_val()? {
+        return Err(s.err_token("array element"));
+    }
+    DeJson::de_json(s)
 }
 
 impl<A, B> SerJson for (A, B)
@@ -1137,10 +983,13 @@ where
     A: DeJson,
     B: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<(A, B), DeJsonErr> {
-        s.block_open(i)?;
-        let r = (de_json_comma_block(s, i)?, de_json_comma_block(s, i)?);
-        s.block_close(i)?;
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<(A, B), DeJsonErr> {
+        s.arr_open()?;
+        let r = (de_json_array_element(s)?, de_json_array_element(s)?);
+        if s.array_next_val()? {
+            return Err(s.err_token("]"));
+        }
+        s.arr_close()?;
         Ok(r)
     }
 }
@@ -1168,14 +1017,17 @@ where
     B: DeJson,
     C: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<(A, B, C), DeJsonErr> {
-        s.block_open(i)?;
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<(A, B, C), DeJsonErr> {
+        s.arr_open()?;
         let r = (
-            de_json_comma_block(s, i)?,
-            de_json_comma_block(s, i)?,
-            de_json_comma_block(s, i)?,
+            de_json_array_element(s)?,
+            de_json_array_element(s)?,
+            de_json_array_element(s)?,
         );
-        s.block_close(i)?;
+        if s.array_next_val()? {
+            return Err(s.err_token("]"));
+        }
+        s.arr_close()?;
         Ok(r)
     }
 }
@@ -1207,15 +1059,18 @@ where
     C: DeJson,
     D: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<(A, B, C, D), DeJsonErr> {
-        s.block_open(i)?;
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<(A, B, C, D), DeJsonErr> {
+        s.arr_open()?;
         let r = (
-            de_json_comma_block(s, i)?,
-            de_json_comma_block(s, i)?,
-            de_json_comma_block(s, i)?,
-            de_json_comma_block(s, i)?,
+            de_json_array_element(s)?,
+            de_json_array_element(s)?,
+            de_json_array_element(s)?,
+            de_json_array_element(s)?,
         );
-        s.block_close(i)?;
+        if s.array_next_val()? {
+            return Err(s.err_token("]"));
+        }
+        s.arr_close()?;
         Ok(r)
     }
 }
@@ -1250,17 +1105,16 @@ where
     V: DeJson,
     S: core::hash::BuildHasher + Default,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Self, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
         let mut h = std::collections::HashMap::with_hasher(S::default());
-        s.curly_open(i)?;
-        while s.tok != DeJsonTok::CurlyClose {
-            let k = DeJson::de_json(s, i)?;
-            s.colon(i)?;
-            let v = DeJson::de_json(s, i)?;
-            s.eat_comma_curly(i)?;
+        s.obj_open()?;
+        while s.object_next_entry()? {
+            let k = DeJson::de_json(s)?;
+            s.colon()?;
+            let v = DeJson::de_json(s)?;
             h.insert(k, v);
         }
-        s.curly_close(i)?;
+        s.obj_close()?;
         Ok(h)
     }
 }
@@ -1292,17 +1146,16 @@ where
     K: DeJson + Eq + Ord,
     V: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Self, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
         let mut h = BTreeMap::new();
-        s.curly_open(i)?;
-        while s.tok != DeJsonTok::CurlyClose {
-            let k = DeJson::de_json(s, i)?;
-            s.colon(i)?;
-            let v = DeJson::de_json(s, i)?;
-            s.eat_comma_curly(i)?;
+        s.obj_open()?;
+        while s.object_next_entry()? {
+            let k = DeJson::de_json(s)?;
+            s.colon()?;
+            let v = DeJson::de_json(s)?;
             h.insert(k, v);
         }
-        s.curly_close(i)?;
+        s.obj_close()?;
         Ok(h)
     }
 }
@@ -1320,8 +1173,11 @@ impl<T> DeJson for Box<T>
 where
     T: DeJson,
 {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Box<T>, DeJsonErr> {
-        Ok(Box::new(DeJson::de_json(s, i)?))
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
+        Self::de_json(s)
+    }
+    fn de_json(s: &mut DeJsonScope<'_, '_>) -> Result<Box<T>, DeJsonErr> {
+        Ok(Box::new(DeJson::de_json(s)?))
     }
 }
 
@@ -1337,26 +1193,26 @@ impl SerJson for Duration {
 }
 
 impl DeJson for Duration {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<Duration, DeJsonErr> {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Duration, DeJsonErr> {
         let mut sec = None;
         let mut nanos = None;
-        s.curly_open(i)?;
-        while s.tok != DeJsonTok::CurlyClose {
-            let k: String = DeJson::de_json(s, i)?;
+        s.obj_open()?;
+        while s.object_next_entry()? {
+            let k: String = DeJson::de_json(s)?;
             match k.as_str() {
                 "secs" => {
                     if sec.is_some() {
                         return Err(s.err_parse("Duration can only have one secs field"));
                     }
-                    s.colon(i)?;
-                    sec = Some(DeJson::de_json(s, i)?);
+                    s.colon()?;
+                    sec = Some(DeJson::de_json(s)?);
                 }
                 "nanos" => {
                     if nanos.is_some() {
                         return Err(s.err_parse("Duration can only have one nanos field"));
                     }
-                    s.colon(i)?;
-                    nanos = Some(DeJson::de_json(s, i)?);
+                    s.colon()?;
+                    nanos = Some(DeJson::de_json(s)?);
                 }
                 _ => {
                     return Err(s.err_parse(&format!(
@@ -1364,9 +1220,8 @@ impl DeJson for Duration {
                     )));
                 }
             }
-            s.eat_comma_curly(i)?;
         }
-        s.curly_close(i)?;
+        s.obj_close()?;
 
         let secs = sec.ok_or_else(|| s.err_parse("Duration must have secs field"))?;
         let nanos = nanos.unwrap_or(0);
@@ -1390,10 +1245,367 @@ impl SerJson for std::time::SystemTime {
 
 #[cfg(feature = "std")]
 impl DeJson for std::time::SystemTime {
-    fn de_json(s: &mut DeJsonState, i: &mut Chars) -> Result<std::time::SystemTime, DeJsonErr> {
-        match DeJson::de_json(s, i)? {
+    fn de_json_value(s: &mut DeJsonScope<'_, '_>) -> Result<Self, DeJsonErr> {
+        Self::de_json(s)
+    }
+    fn de_json(s: &mut DeJsonScope<'_, '_>) -> Result<std::time::SystemTime, DeJsonErr> {
+        match DeJson::de_json(s)? {
             Some(dur) => Ok(std::time::SystemTime::UNIX_EPOCH + dur),
             None => Ok(std::time::SystemTime::UNIX_EPOCH),
         }
+    }
+}
+
+/// A JSON input structure. Children borrow shared tokenizer state independently.
+pub struct DeJsonScope<'state, 'input> {
+    state: &'state mut DeJsonState<'input>,
+    opener: DeJsonTok,
+    closer: DeJsonTok,
+    done: bool,
+    // An unused scope may finish after another scope reads the same value.
+    can_finish: bool,
+}
+
+impl<'state, 'input> core::ops::Deref for DeJsonScope<'state, 'input> {
+    type Target = DeJsonState<'input>;
+    fn deref(&self) -> &Self::Target {
+        self.state
+    }
+}
+
+impl<'state, 'input> DeJsonScope<'state, 'input> {
+    pub fn root(state: &'state mut DeJsonState<'input>) -> Self {
+        Self {
+            state,
+            opener: DeJsonTok::Bof,
+            closer: DeJsonTok::Eof,
+            done: false,
+            can_finish: true,
+        }
+    }
+
+    pub fn new_scope(&mut self) -> Result<DeJsonScope<'_, 'input>, DeJsonErr> {
+        let (opener, closer) = match self.token() {
+            DeJsonTok::CurlyOpen => (DeJsonTok::CurlyOpen, DeJsonTok::CurlyClose),
+            DeJsonTok::BlockOpen => (DeJsonTok::BlockOpen, DeJsonTok::BlockClose),
+            _ => return Err(self.err_token("{ or [")),
+        };
+        if self.done {
+            return Err(self.err_parse("scope already finished"));
+        }
+        Ok(DeJsonScope {
+            state: &mut *self.state,
+            opener,
+            closer,
+            done: false,
+            can_finish: true,
+        })
+    }
+
+    pub fn token(&self) -> &DeJsonTok {
+        &self.state.tok
+    }
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+    pub fn is_null(&self) -> bool {
+        *self.token() == DeJsonTok::Null
+    }
+    pub fn is_string(&self) -> bool {
+        *self.token() == DeJsonTok::Str
+    }
+    pub fn is_object_opener(&self) -> bool {
+        *self.token() == DeJsonTok::CurlyOpen
+    }
+    pub fn is_array_opener(&self) -> bool {
+        *self.token() == DeJsonTok::BlockOpen
+    }
+
+    /// Advance within this scope. Parent navigation consumes completed child closers.
+    pub fn next_tok(&mut self) -> Result<(), DeJsonErr> {
+        if self.done {
+            return Err(self.err_parse("cannot advance a finished scope"));
+        }
+        self.can_finish = false;
+        self.state.scan_token()?;
+        if *self.token() == self.closer {
+            self.done = true;
+            self.can_finish = true;
+        } else if matches!(
+            self.token(),
+            DeJsonTok::CurlyClose | DeJsonTok::BlockClose | DeJsonTok::Eof
+        ) {
+            return Err(self.err_token(&format!("{:?}", self.closer)));
+        }
+        Ok(())
+    }
+
+    pub fn check_token(&self, expected: &DeJsonTok) -> Result<(), DeJsonErr> {
+        if self.token() == expected {
+            Ok(())
+        } else {
+            Err(self.err_token(&format!("{expected:?}")))
+        }
+    }
+    pub fn next_token_is(&mut self, expected: &DeJsonTok) -> Result<(), DeJsonErr> {
+        self.next_tok()?;
+        self.check_token(expected)
+    }
+    pub fn finish(&self) -> Result<(), DeJsonErr> {
+        if self.can_finish && *self.token() == self.closer {
+            Ok(())
+        } else {
+            Err(self.err_token(&format!("{:?}", self.closer)))
+        }
+    }
+
+    pub fn obj_open(&mut self) -> Result<(), DeJsonErr> {
+        self.check_token(&DeJsonTok::CurlyOpen)?;
+        self.can_finish = false;
+        Ok(())
+    }
+    pub fn arr_open(&mut self) -> Result<(), DeJsonErr> {
+        self.check_token(&DeJsonTok::BlockOpen)?;
+        self.can_finish = false;
+        Ok(())
+    }
+    pub fn obj_close(&self) -> Result<(), DeJsonErr> {
+        if self.closer != DeJsonTok::CurlyClose {
+            return Err(self.err_token("object scope"));
+        }
+        self.finish()
+    }
+    pub fn arr_close(&self) -> Result<(), DeJsonErr> {
+        if self.closer != DeJsonTok::BlockClose {
+            return Err(self.err_token("array scope"));
+        }
+        self.finish()
+    }
+
+    fn next_entry(&mut self, object: bool) -> Result<bool, DeJsonErr> {
+        let expected = if object {
+            DeJsonTok::CurlyOpen
+        } else {
+            DeJsonTok::BlockOpen
+        };
+        if self.opener != expected {
+            return Err(self.err_token("matching container scope"));
+        }
+        if self.done {
+            return Ok(false);
+        }
+        if *self.token() == self.opener {
+            self.next_tok()?;
+            return Ok(!self.done);
+        }
+        if matches!(self.token(), DeJsonTok::CurlyClose | DeJsonTok::BlockClose) {
+            self.next_tok()?;
+            if self.done {
+                return Ok(false);
+            }
+        }
+        if *self.token() != DeJsonTok::Comma {
+            return Err(self.err_sep());
+        }
+        self.next_tok()?;
+        if self.done {
+            return Err(self.err_sep());
+        }
+        Ok(true)
+    }
+
+    pub fn array_next_val(&mut self) -> Result<bool, DeJsonErr> {
+        self.next_entry(false)
+    }
+    pub fn object_next_entry(&mut self) -> Result<bool, DeJsonErr> {
+        self.next_entry(true)
+    }
+
+    pub fn next_key<'k>(&mut self, keys: &[&'k str]) -> Result<Option<&'k str>, DeJsonErr> {
+        if !self.object_next_entry()? {
+            return Ok(None);
+        }
+        self.check_token(&DeJsonTok::Str)?;
+        let key = keys
+            .iter()
+            .copied()
+            .find(|key| *key == self.state.strbuf)
+            .ok_or_else(|| self.err_exp(&self.state.strbuf))?;
+        self.next_colon()?;
+        Ok(Some(key))
+    }
+
+    pub fn next_key_string(&mut self) -> Result<Option<String>, DeJsonErr> {
+        if !self.object_next_entry()? {
+            return Ok(None);
+        }
+        let key = self.parse_string()?;
+        self.colon()?;
+        Ok(Some(key))
+    }
+
+    pub fn colon(&mut self) -> Result<(), DeJsonErr> {
+        self.check_token(&DeJsonTok::Colon)?;
+        self.next_tok()?;
+        if matches!(
+            self.token(),
+            DeJsonTok::Comma
+                | DeJsonTok::Colon
+                | DeJsonTok::CurlyClose
+                | DeJsonTok::BlockClose
+                | DeJsonTok::Eof
+        ) {
+            return Err(self.err_token("JSON value"));
+        }
+        Ok(())
+    }
+    pub fn next_colon(&mut self) -> Result<(), DeJsonErr> {
+        self.next_tok()?;
+        self.colon()
+    }
+
+    /// Read an enum's single field, accepting nanoserde's older `[value]` wrapper.
+    #[doc(hidden)]
+    pub fn parse_variant_value<T: DeJson>(&mut self) -> Result<T, DeJsonErr> {
+        // Try the current wire representation first, so Vec/tuple/aliased fields
+        // get their own array scope. Only try the legacy wrapper if no input was
+        // consumed and the original array opener is still current. No rewind or
+        // cloned input buffers are needed.
+        let before = (self.state.input.as_str().len(), self.state.cur);
+        match T::de_json(self) {
+            Err(_)
+                if self.is_array_opener()
+                    && before == (self.state.input.as_str().len(), self.state.cur) =>
+            {
+                let mut child = self.new_scope()?;
+                if !child.array_next_val()? {
+                    return Err(child.err_token("array element"));
+                }
+                let value = T::de_json(&mut child)?;
+                if child.array_next_val()? {
+                    return Err(child.err_token("]"));
+                }
+                child.arr_close()?;
+                Ok(value)
+            }
+            result => result,
+        }
+    }
+
+    pub fn skip_value(&mut self) -> Result<(), DeJsonErr> {
+        match self.token() {
+            DeJsonTok::CurlyOpen => {
+                let mut child = self.new_scope()?;
+                while child.next_key_string()?.is_some() {
+                    child.skip_value()?;
+                }
+                child.obj_close()
+            }
+            DeJsonTok::BlockOpen => {
+                let mut child = self.new_scope()?;
+                while child.array_next_val()? {
+                    child.skip_value()?;
+                }
+                child.arr_close()
+            }
+            DeJsonTok::Str
+            | DeJsonTok::U64(_)
+            | DeJsonTok::I64(_)
+            | DeJsonTok::F64(_)
+            | DeJsonTok::Bool(_)
+            | DeJsonTok::Null => self.next_tok(),
+            _ => Err(self.err_token("JSON value")),
+        }
+    }
+
+    pub fn parse_string(&mut self) -> Result<String, DeJsonErr> {
+        let value = self.as_string()?;
+        self.next_tok()?;
+        Ok(value)
+    }
+    pub fn parse_bool(&mut self) -> Result<bool, DeJsonErr> {
+        let value = self.as_bool()?;
+        self.next_tok()?;
+        Ok(value)
+    }
+    pub fn parse_null(&mut self) -> Result<(), DeJsonErr> {
+        self.check_token(&DeJsonTok::Null)?;
+        self.next_tok()
+    }
+    fn u64_range(&mut self, max: u64) -> Result<u64, DeJsonErr> {
+        if let DeJsonTok::U64(value) = self.tok {
+            if value > max {
+                return Err(self.err_range(&format!("{}>{}", value, max)));
+            }
+            return Ok(value);
+        }
+        Err(self.err_token("unsigned integer"))
+    }
+
+    fn i64_range(&mut self, min: i64, max: i64) -> Result<i64, DeJsonErr> {
+        if let DeJsonTok::I64(value) = self.tok {
+            if value < min {
+                return Err(self.err_range(&format!("{}<{}", value, min)));
+            }
+            if value > max {
+                return Err(self.err_range(&format!("{}>{}", value, max)));
+            }
+            return Ok(value);
+        }
+        if let DeJsonTok::U64(value) = self.tok {
+            if value > max as u64 {
+                return Err(self.err_range(&format!("{}>{}", value, max)));
+            }
+            return Ok(value as i64);
+        }
+        Err(self.err_token("signed integer"))
+    }
+
+    fn as_f64(&mut self) -> Result<f64, DeJsonErr> {
+        if let DeJsonTok::I64(value) = self.tok {
+            return Ok(value as f64);
+        }
+        if let DeJsonTok::U64(value) = self.tok {
+            return Ok(value as f64);
+        }
+        if let DeJsonTok::F64(value) = self.tok {
+            return Ok(value);
+        }
+        Err(self.err_token("floating point"))
+    }
+
+    fn as_bool(&mut self) -> Result<bool, DeJsonErr> {
+        if let DeJsonTok::Bool(value) = self.tok {
+            return Ok(value);
+        }
+        Err(self.err_token("boolean"))
+    }
+
+    fn as_string(&mut self) -> Result<String, DeJsonErr> {
+        if let DeJsonTok::Str = &self.state.tok {
+            let mut val = String::new();
+            core::mem::swap(&mut val, &mut self.state.strbuf);
+            return Ok(val);
+        }
+        Err(self.err_token("string"))
+    }
+}
+
+macro_rules! scope_unsigned { ($($name:ident: $ty:ty),* $(,)?) => { impl DeJsonScope<'_, '_> { $(
+    pub fn $name(&mut self) -> Result<$ty, DeJsonErr> { let value = self.u64_range(<$ty>::MAX as u64)?; self.next_tok()?; Ok(value as $ty) }
+)* } }; }
+macro_rules! scope_signed { ($($name:ident: $ty:ty),* $(,)?) => { impl DeJsonScope<'_, '_> { $(
+    pub fn $name(&mut self) -> Result<$ty, DeJsonErr> { let value = self.i64_range(<$ty>::MIN as i64, <$ty>::MAX as i64)?; self.next_tok()?; Ok(value as $ty) }
+)* } }; }
+scope_unsigned!(parse_u8: u8, parse_u16: u16, parse_u32: u32, parse_u64: u64, parse_usize: usize);
+scope_signed!(parse_i8: i8, parse_i16: i16, parse_i32: i32, parse_i64: i64, parse_isize: isize);
+impl DeJsonScope<'_, '_> {
+    pub fn parse_f64(&mut self) -> Result<f64, DeJsonErr> {
+        let value = self.as_f64()?;
+        self.next_tok()?;
+        Ok(value)
+    }
+    pub fn parse_f32(&mut self) -> Result<f32, DeJsonErr> {
+        self.parse_f64().map(|value| value as f32)
     }
 }

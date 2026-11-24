@@ -139,6 +139,7 @@ pub fn derive_de_json_named(
     let mut struct_field_names = Vec::new();
     let mut matches = Vec::new();
     let mut unwraps = Vec::new();
+    let mut skipped = Vec::new();
 
     let container_attr_default = defaults;
 
@@ -210,6 +211,7 @@ pub fn derive_de_json_named(
             matches.push((json_fieldname, localvar.clone()));
             local_vars.push(localvar);
         } else {
+            skipped.push(json_fieldname);
             unwraps.push(default_val.unwrap_or_else(|| String::from("Default::default()")));
         }
 
@@ -220,30 +222,25 @@ pub fn derive_de_json_named(
     for local_var in &local_vars {
         l!(r, "let mut {} = None;", local_var);
     }
-    l!(r, "s.curly_open(i) ?;");
-    l!(r, "while s.next_str().is_some() {");
-
-    // Skip unknown fields even when the struct itself has none.
-    l!(r, "match AsRef::<str>::as_ref(&s.strbuf) {");
+    let names = matches
+        .iter()
+        .map(|(name, _)| format!("{name:?}"))
+        .chain(skipped.iter().map(|name| format!("{name:?}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    l!(r, "s.obj_open()?;");
+    l!(r, "while let Some(key) = s.next_key(&[{}])? {{", names);
+    l!(r, "match key {");
     for (json_field_name, local_var) in matches.iter() {
-        l!(
-            r,
-            "\"{}\" => {{s.next_colon(i) ?;{} = Some({}::DeJson::de_json(s, i) ?)}},",
-            json_field_name,
-            local_var,
-            crate_name
-        );
+        l!(r, "{json_field_name:?} => {{ if {local_var}.is_some() {{ return Err(s.err_parse(concat!(\"duplicate field \", {json_field_name:?}))); }} {local_var} = Some({crate_name}::DeJson::de_json(s)?); }},",);
     }
-    // TODO: maybe introduce "exhaustive" attribute?
-    // l!(
-    //     r,
-    //     "_ => return ::core::result::Result::Err(s.err_exp(&s.strbuf))"
-    // );
-    l!(r, "_ => {s.next_colon(i)?; s.whole_field(i)?; }");
+    for name in skipped {
+        l!(r, "{name:?} => s.skip_value()?,",);
+    }
+    l!(r, "_ => unreachable!(),");
     l!(r, "}");
-    l!(r, "s.eat_comma_curly(i) ?;");
     l!(r, "}");
-    l!(r, "s.curly_close(i) ?;");
+    l!(r, "s.obj_close()?;");
     l!(r, "{} {{", name);
     for (field_name, unwrap) in struct_field_names.iter().zip(unwraps.iter()) {
         l!(r, "{}: {},", field_name, unwrap);
@@ -257,8 +254,8 @@ pub fn derive_de_json_proxy(proxy_type: &str, type_: &str, crate_name: &str) -> 
     format!(
         "impl {}::DeJson for {} {{
             #[allow(clippy::ignored_unit_patterns)]
-            fn de_json(s: &mut {}::DeJsonState, i: &mut core::str::Chars) -> ::core::result::Result<Self, {}::DeJsonErr> {{
-                let proxy: {} = {}::DeJson::de_json(s, i)?;
+            fn de_json_value(s: &mut {}::DeJsonScope<'_, '_>) -> ::core::result::Result<Self, {}::DeJsonErr> {{
+                let proxy: {} = {}::DeJson::de_json(s)?;
                 ::core::result::Result::Ok(Into::into(&proxy))
             }}
         }}",
@@ -285,12 +282,24 @@ pub fn derive_de_json_struct(struct_: &Struct, crate_name: &str) -> TokenStream 
     format!(
         "impl{} {}::DeJson for {}{} {{
             #[allow(clippy::ignored_unit_patterns)]
-            fn de_json(s: &mut {}::DeJsonState, i: &mut core::str::Chars) -> ::core::result::Result<Self,
+            fn de_json_value(s: &mut {}::DeJsonScope<'_, '_>) -> ::core::result::Result<Self,
             {}::DeJsonErr> {{
                 ::core::result::Result::Ok({{ {} }})
             }}
-        }}", generic_w_bounds, crate_name, struct_.name.as_ref().expect("Cannot implement for anonymous struct"), generic_no_bounds, crate_name, crate_name, body)
-        .parse().unwrap()
+        }}",
+        generic_w_bounds,
+        crate_name,
+        struct_
+            .name
+            .as_ref()
+            .expect("Cannot implement for anonymous struct"),
+        generic_no_bounds,
+        crate_name,
+        crate_name,
+        body
+    )
+    .parse()
+    .unwrap()
 }
 
 pub fn derive_ser_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
@@ -452,129 +461,62 @@ pub fn derive_ser_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
 }
 
 pub fn derive_de_json_enum(enum_: &Enum, crate_name: &str) -> TokenStream {
-    let mut r_units = String::new();
-    let mut r_rest = String::new();
-    let (generic_w_bounds, generic_no_bounds) = enum_bounds_strings(enum_, "DeJson", crate_name);
-
+    let (bounds, args) = enum_bounds_strings(enum_, "DeJson", crate_name);
+    let mut units = String::new();
+    let mut objects = String::new();
+    let mut names = Vec::new();
     for variant in &enum_.variants {
-        let field_name = variant.field_name.clone().unwrap();
-        let json_variant_name =
-            shared::attrs_rename(&variant.attributes).unwrap_or(field_name.clone());
-
-        match &variant.ty {
-            Type {
-                wraps: None,
-                ident: Category::None,
-                ..
-            } => {
-                // unit variant
-                l!(
-                    r_units,
-                    "\"{}\" => Self::{},",
-                    json_variant_name,
-                    &field_name
-                );
+        let field_name = variant.field_name.as_ref().unwrap();
+        let wire = shared::attrs_rename(&variant.attributes).unwrap_or(field_name.clone());
+        match &variant.ty.ident {
+            Category::None => {
+                l!(units, "{wire:?} => Self::{field_name},",);
             }
-            Type {
-                ident: Category::AnonymousStruct { contents },
-                ..
-            } => {
+            Category::AnonymousStruct { contents } => {
+                names.push(format!("{wire:?}"));
                 let body = derive_de_json_named(
-                    &format!("Self::{}", &field_name),
+                    &format!("Self::{field_name}"),
                     false,
                     &contents.fields,
                     crate_name,
                 );
-                l!(r_rest, "\"{}\" => {{ {} }}, ", json_variant_name, body);
+                l!(objects, "{wire:?} => {{ let mut nested = s.new_scope()?; let s = &mut nested; {body} }},",);
             }
-            Type {
-                ident: Category::Tuple { contents },
-                ..
-            } => {
-                
-
+            Category::Tuple { contents } => {
+                names.push(format!("{wire:?}"));
                 if contents.len() == 1 {
                     l!(
-                        r_rest,
-                        "\"{}\" => {{let is_old = s.block_open(i).is_ok(); let r = Self::{}({}::DeJson::de_json(s,i)?); if is_old {{s.eat_comma_block(i)?; s.block_close(i)?;}} r}}",
-                        json_variant_name,
-                        &field_name,
-                        crate_name
+                        objects,
+                        "{wire:?} => Self::{field_name}(s.parse_variant_value()?),",
                     );
                 } else {
-                    let mut field_names = String::new();
-                    for _ in contents.iter() {
-                        l!(
-                            field_names,
-                            "{{let r = {}::DeJson::de_json(s,i)?;s.eat_comma_block(i)?;r}},",
-                            crate_name
-                        );
+                    let mut reads = String::new();
+                    for _ in contents {
+                        l!(reads, "{{ if !s.array_next_val()? {{ return Err(s.err_token(\"array element\")); }} {crate_name}::DeJson::de_json(s)? }},",);
                     }
-                    l!(
-                        r_rest,
-                        "\"{}\" => {{s.block_open(i)?;let r = Self::{}({}); s.block_close(i)?;r}}",
-                        json_variant_name,
-                        &field_name,
-                        field_names
-                    );
+                    l!(objects, "{wire:?} => {{ let mut nested = s.new_scope()?; let s = &mut nested; s.arr_open()?; let value = Self::{field_name}({reads}); if s.array_next_val()? {{ return Err(s.err_token(\"]\")); }} s.arr_close()?; value }},",);
                 }
             }
-            v => {
-                unimplemented!("Unexpected type in enum: {:?}", v)
-            }
-        };
-    }
-
-    let mut r = format!(
-        "impl{} {}::DeJson for {}{} {{
-            #[allow(clippy::ignored_unit_patterns)]
-            fn de_json(s: &mut {}::DeJsonState, i: &mut core::str::Chars) -> ::core::result::Result<Self, {}::DeJsonErr> {{
-                match s.tok {{",
-        generic_w_bounds, crate_name, enum_.name, generic_no_bounds, crate_name, crate_name
-    );
-
-    if !r_rest.is_empty() {
-        r.push_str(&format!(
-            "
-                    {}::DeJsonTok::CurlyOpen => {{
-                        s.curly_open(i)?;
-                        let _ = s.string(i)?;
-                        s.colon(i)?;
-                        let r = ::core::result::Result::Ok(match s.strbuf.as_ref() {{
-                            {}
-                            _ => return ::core::result::Result::Err(s.err_enum(&s.strbuf))
-                        }});
-                        s.curly_close(i)?;
-                        r
-                    }},",
-            crate_name, r_rest,
-        ))
-    }
-
-    if !r_units.is_empty() {
-        r.push_str(&format!(
-            "
-                    {}::DeJsonTok::Str => {{
-                        let _ = s.string(i)?;
-                        ::core::result::Result::Ok(match s.strbuf.as_ref() {{
-                            {}
-                            _ => return ::core::result::Result::Err(s.err_enum(&s.strbuf))
-                        }})
-                    }},",
-            crate_name, r_units,
-        ))
-    }
-
-    r.push_str(
-        r#"
-                    _ => ::core::result::Result::Err(s.err_token("String or {")),
-                }
-            }
+            _ => unreachable!(),
         }
-"#,
-    );
-
-    r.parse().unwrap()
+    }
+    let names = names.join(",");
+    let unit_read = if units.is_empty() {
+        String::new()
+    } else {
+        format!("if s.is_string() {{ let name = s.parse_string()?; return Ok(match name.as_str() {{ {units} _ => return Err(s.err_enum(&name)), }}); }}")
+    };
+    let object_read = if objects.is_empty() {
+        "Err(s.err_token(\"enum string\"))".to_string()
+    } else {
+        format!("s.obj_open()?; let name = s.next_key(&[{names}])?.ok_or_else(|| s.err_token(\"enum variant\"))?; let value = match name {{ {objects} _ => unreachable!(), }}; if s.object_next_entry()? {{ return Err(s.err_token(\"}}\")); }} s.obj_close()?; Ok(value)")
+    };
+    format!("impl{bounds} {crate_name}::DeJson for {name}{args} {{
+        fn de_json_value(s: &mut {crate_name}::DeJsonScope<'_, '_>) -> ::core::result::Result<Self, {crate_name}::DeJsonErr> {{
+            {unit_read}
+            {object_read}
+        }}
+    }}", name=enum_.name).parse().unwrap()
 }
 
 pub fn derive_ser_json_struct_unnamed(struct_: &Struct, crate_name: &str) -> TokenStream {
@@ -629,47 +571,205 @@ pub fn derive_ser_json_struct_unnamed(struct_: &Struct, crate_name: &str) -> Tok
 }
 
 pub fn derive_de_json_struct_unnamed(struct_: &Struct, crate_name: &str) -> TokenStream {
+    let (bounds, args) = struct_bounds_strings(struct_, "DeJson", crate_name);
+    let transparent = shared::attrs_transparent(&struct_.attributes) && struct_.fields.len() == 1;
     let mut body = String::new();
-    let (generic_w_bounds, generic_no_bounds) =
-        struct_bounds_strings(struct_, "DeJson", crate_name);
-
-    let transparent = shared::attrs_transparent(&struct_.attributes);
-
-    for _ in &struct_.fields {
-        l!(body, "{{ let r = {}::DeJson::de_json(s, i)?;", crate_name);
-        if struct_.fields.len() != 1 {
-            l!(body, "  s.eat_comma_block(i)?;");
+    if struct_.fields.is_empty() {
+        body.push_str("s.obj_open()?; if s.object_next_entry()? { return Err(s.err_token(\"}\")); } s.obj_close()?; Ok(Self)");
+    } else if transparent {
+        l!(body, "Ok(Self({crate_name}::DeJson::de_json(s)?))",);
+    } else {
+        body.push_str("s.arr_open()?; let value = Self(");
+        for _ in &struct_.fields {
+            l!(body, "{{ if !s.array_next_val()? {{ return Err(s.err_token(\"array element\")); }} {crate_name}::DeJson::de_json(s)? }},",);
         }
-        l!(body, "  r");
-        l!(body, "},");
+        body.push_str("); if s.array_next_val()? { return Err(s.err_token(\"]\")); } s.arr_close()?; Ok(value)");
     }
+    format!("impl{bounds} {crate_name}::DeJson for {name}{args} {{
+        fn de_json_value(s: &mut {crate_name}::DeJsonScope<'_, '_>) -> ::core::result::Result<Self, {crate_name}::DeJsonErr> {{ {body} }}
+    }}", name=struct_.name.as_ref().unwrap()).parse().unwrap()
+}
 
-    // no fields - was encoded as {}
-    let body = if struct_.fields.is_empty() {
-        "s.curly_open(i)?;let r = Self;s.curly_close(i)?;".to_string()
+// Save the original declaration in a small crate-local macro.
+pub fn derive_json_helpers(struct_: &Struct, declaration: TokenStream) -> TokenStream {
+    use proc_macro::{Delimiter, Group, TokenTree};
+    let struct_name = struct_.name.as_ref().unwrap();
+    let helper = format!("__nanoserde_json_metadata_{struct_name}");
+    let wrapper: TokenStream = format!(
+        "#[allow(unused_macros)] macro_rules! {helper} {{
+            ($generator:path) => {{ $generator! {{}} }};
+        }}
+        #[allow(unused_imports)] pub(crate) use {helper} as {struct_name};"
+    )
+    .parse()
+    .unwrap();
+    // The only empty brace group in the wrapper is the generator's input.
+    fn insert(tokens: TokenStream, declaration: &TokenStream) -> TokenStream {
+        tokens
+            .into_iter()
+            .map(|token| match token {
+                TokenTree::Group(group) => {
+                    let contents =
+                        if group.delimiter() == Delimiter::Brace && group.stream().is_empty() {
+                            declaration.clone()
+                        } else {
+                            insert(group.stream(), declaration)
+                        };
+                    let mut replacement = Group::new(group.delimiter(), contents);
+                    replacement.set_span(group.span());
+                    TokenTree::Group(replacement)
+                }
+                other => other,
+            })
+            .collect()
     }
-    // if it was transparent newtype struct - skip "container"
-    // and just deserialize content
-    else if transparent && struct_.fields.len() == 1 {
-        format!("let r = Self({});", body)
-    }
-    // more than one field, was an array []
-    else {
-        format!(
-            "s.block_open(i)?;
-             let r = Self({});
-             s.block_close(i)?;",
-            body
-        )
-    };
+    insert(wrapper, &declaration)
+}
 
-    format! ("
-        impl{} {}::DeJson for {}{} {{
-            #[allow(clippy::ignored_unit_patterns)]
-            fn de_json(s: &mut {}::DeJsonState, i: &mut core::str::Chars) -> ::core::result::Result<Self,{}::DeJsonErr> {{
-                {}
-                ::core::result::Result::Ok(r)
+// Local Fields/Key declarations need their own destination parameters.
+fn json_helper_parameters(struct_: &Struct, crate_name: &str) -> (String, String, String, String) {
+    use crate::parse::Generic;
+    let mut declarations = String::new();
+    let mut arguments = String::new();
+    let mut parser_declarations = String::new();
+    for generic in struct_.generics.iter().filter(|g| g.ident_only() != "Self") {
+        l!(arguments, "{},", generic.ident_only());
+        l!(declarations, "{},", generic.full_with_const(&[], true));
+        let extra = if matches!(
+            generic,
+            Generic::Generic { .. } | Generic::WhereBounded { .. }
+        ) {
+            vec![format!("{crate_name}::DeJson")]
+        } else {
+            vec![]
+        };
+        l!(
+            parser_declarations,
+            "{},",
+            generic.full_with_const(&extra.iter().map(|v| v.as_str()).collect::<Vec<_>>(), true)
+        );
+    }
+    let destination = format!("{}<{arguments}>", struct_.name.as_ref().unwrap());
+    (declarations, arguments, parser_declarations, destination)
+}
+
+pub fn generate_json_fields(struct_: &Struct, crate_name: &str) -> TokenStream {
+    let (decl, args, _, destination) = json_helper_parameters(struct_, crate_name);
+    let mut members = String::new();
+    let mut variants = String::new();
+    let mut names = String::new();
+    let mut initialization = String::new();
+    let mut arms = String::new();
+    for field in &struct_.fields {
+        let rust_field = field.field_name.as_ref().unwrap();
+        let json_field = shared::attrs_rename(&field.attributes).unwrap_or(rust_field.clone());
+        let ty = replace_self_type(field.ty.full().parse().unwrap(), &destination).to_string();
+        l!(members, "{rust_field}: ::core::option::Option<{ty}>,",);
+        l!(
+            variants,
+            "{rust_field}(&'__nanoserde_field mut ::core::option::Option<{ty}>),",
+        );
+        l!(names, "{json_field:?},",);
+        l!(
+            initialization,
+            "{rust_field}: ::core::option::Option::None,",
+        );
+        let duplicate = format!("duplicate field {json_field}");
+        l!(
+            arms,
+            "{json_field:?} => {{
+            if self.{rust_field}.is_some() {{ return Err(scope.err_parse({duplicate:?})); }}
+            Ok(Some(Key::{rust_field}(&mut self.{rust_field})))
+        }},",
+        );
+    }
+    format!(
+        "#[allow(dead_code)]
+        struct Fields<{decl}> {{ {members} }}
+        #[allow(non_camel_case_types, dead_code)]
+        enum Key<'__nanoserde_field, {decl}> {{
+            {variants}
+            __nanoserde_uninhabited(::core::convert::Infallible,
+                ::core::marker::PhantomData<&'__nanoserde_field mut Fields<{args}>>),
+        }}
+        #[allow(dead_code)]
+        impl<{decl}> Fields<{args}> {{
+            const NAMES: &'static [&'static str] = &[{names}];
+            fn new() -> Self {{ Self {{ {initialization} }} }}
+            fn match_next_key<'__nanoserde_field>(
+                &'__nanoserde_field mut self,
+                scope: &mut {crate_name}::DeJsonScope<'_, '_>,
+            ) -> ::core::result::Result<::core::option::Option<Key<'__nanoserde_field, {args}>>, {crate_name}::DeJsonErr> {{
+                let Some(key) = scope.next_key(Self::NAMES)? else {{ return Ok(None); }};
+                match key {{ {arms} _ => unreachable!(), }}
             }}
-        }}",generic_w_bounds, crate_name, struct_.name.as_ref().expect("Cannot implement for anonymous struct"), generic_no_bounds, crate_name, crate_name,body
+        }}"
     ).parse().unwrap()
+}
+
+pub fn generate_json_parser(struct_: &Struct, crate_name: &str) -> TokenStream {
+    let (_, args, bounds, destination) = json_helper_parameters(struct_, crate_name);
+    let mut arms = String::new();
+    for field in &struct_.fields {
+        let rust_field = field.field_name.as_ref().unwrap();
+        let ty = replace_self_type(field.ty.full().parse().unwrap(), &destination).to_string();
+        let body = if shared::attrs_skip(&field.attributes) {
+            "let _ = destination; scope.skip_value()?;".to_string()
+        } else if let Some(proxy) = shared::attrs_proxy(&field.attributes) {
+            if field.ty.base() == "Option" {
+                format!("let value = <::core::option::Option<{proxy}> as {crate_name}::DeJson>::de_json(scope)?;
+                    *destination = Some(value.as_ref().map(::core::convert::From::from));")
+            } else {
+                format!(
+                    "let value = <{proxy} as {crate_name}::DeJson>::de_json(scope)?;
+                    *destination = Some(<{ty} as ::core::convert::From<&{proxy}>>::from(&value));"
+                )
+            }
+        } else {
+            format!("*destination = Some(<{ty} as {crate_name}::DeJson>::de_json(scope)?);")
+        };
+        l!(arms, "Key::{rust_field}(destination) => {{ {body} }},",);
+    }
+    format!(
+        "struct Parser;
+        impl Parser {{
+            #[allow(unreachable_code)]
+            fn parse_field<{bounds}>(
+                key: Key<'_, {args}>,
+                scope: &mut {crate_name}::DeJsonScope<'_, '_>,
+            ) -> ::core::result::Result<(), {crate_name}::DeJsonErr> {{
+                match key {{
+                    {arms}
+                    Key::__nanoserde_uninhabited(never, _) => match never {{}},
+                }}
+                Ok(())
+            }}
+        }}"
+    )
+    .parse()
+    .unwrap()
+}
+
+// Self in a destination field means the destination, not the local Fields/Parser.
+fn replace_self_type(tokens: TokenStream, destination: &str) -> TokenStream {
+    use proc_macro::{Group, TokenTree};
+    let mut out = TokenStream::new();
+    for token in tokens {
+        match token {
+            TokenTree::Ident(ref ident) if ident.to_string() == "Self" => {
+                let parsed = destination.parse::<TokenStream>().unwrap();
+                out.extend(parsed);
+            }
+            TokenTree::Group(group) => {
+                let mut result = Group::new(
+                    group.delimiter(),
+                    replace_self_type(group.stream(), destination),
+                );
+                result.set_span(group.span());
+                out.extend(TokenStream::from(TokenTree::Group(result)));
+            }
+            other => out.extend(TokenStream::from(other)),
+        }
+    }
+    out
 }

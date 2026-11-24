@@ -74,3 +74,9 @@ in your `Cargo.toml` and add one or more of the following crate features:
 | JSON      | `json`         |
 | RON       | `ron`          |
 | TOML      | `toml`         |
+
+## JSON deserializer refactor
+
+This fork uses input-owning tokenizer state and per-container scopes for JSON deserialization.
+See [the JSON API guide](docs/json-deserializer-api.md) for custom readers, generated local
+Fields/Key/Parser helpers, scope movement rules, and behavior changes.
